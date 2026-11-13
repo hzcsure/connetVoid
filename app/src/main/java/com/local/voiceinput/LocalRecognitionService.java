@@ -10,6 +10,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.speech.RecognitionService;
+import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.util.Log;
 
@@ -49,7 +50,7 @@ public class LocalRecognitionService extends RecognitionService {
     @Override
     protected void onStartListening(Intent recognizerIntent, Callback listener) {
         String lang = recognizerIntent == null ? "?" :
-                recognizerIntent.getStringExtra(Intent.EXTRA_LANGUAGE);
+                recognizerIntent.getStringExtra(RecognizerIntent.EXTRA_LANGUAGE);
         Log.i(TAG, "onStartListening lang=" + lang);
         stopWorker();
         listening = true;
