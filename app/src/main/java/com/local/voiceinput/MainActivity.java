@@ -20,6 +20,7 @@ public class MainActivity extends Activity {
 
     private static final String TAG = "MainDiag";
     private static final int REQ_AUDIO = 1001;
+    private static final int REQ_VOICE = 1002;
 
     private TextView status;
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -58,6 +59,11 @@ public class MainActivity extends Activity {
         test.setText("3. 自检：录 5 秒并识别");
         test.setOnClickListener(v -> selfTest());
         root.addView(test);
+
+        Button voice = new Button(this);
+        voice.setText("4. 打开语音录入界面（等同 SmartTube 点麦克风）");
+        voice.setOnClickListener(v -> launchVoiceSearch());
+        root.addView(voice);
 
         setContentView(root);
 
@@ -140,6 +146,37 @@ public class MainActivity extends Activity {
         sr.startListening(i);
     }
 
+    /** 模拟 SmartTube：走 android.speech.action.RECOGNIZE_SPEECH 这一路。 */
+    private void launchVoiceSearch() {
+        android.content.Intent i = new android.content.Intent(
+                android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        i.putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE, "zh-CN");
+        i.putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        i.putExtra(android.speech.RecognizerIntent.EXTRA_PROMPT, "请说出要搜索的内容");
+        try {
+            startActivityForResult(i, REQ_VOICE);
+        } catch (android.content.ActivityNotFoundException e) {
+            status.setText("没有界面应答 RECOGNIZE_SPEECH（本机异常）");
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, android.content.Intent data) {
+        if (requestCode != REQ_VOICE) {
+            super.onActivityResult(requestCode, resultCode, data);
+            return;
+        }
+        if (resultCode == RESULT_OK && data != null) {
+            java.util.ArrayList<String> list =
+                    data.getStringArrayListExtra(android.speech.RecognizerIntent.EXTRA_RESULTS);
+            String text = (list == null || list.isEmpty()) ? "" : list.get(0);
+            status.setText("语音录入返回：" + text);
+        } else {
+            status.setText("语音录入被取消或失败");
+        }
+    }
+
     private void refreshStatus() {
         StringBuilder sb = new StringBuilder();
 
@@ -153,6 +190,13 @@ public class MainActivity extends Activity {
 
         boolean available = SpeechRecognizer.isRecognitionAvailable(this);
         sb.append("系统可发现本服务：").append(available ? "是" : "否").append('\n');
+
+        int handlers = getPackageManager().queryIntentActivities(
+                new android.content.Intent(
+                        android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH), 0).size();
+        sb.append("应答 RECOGNIZE_SPEECH 的界面：").append(handlers).append(" 个")
+                .append(handlers > 0 ? "（点麦克风会有录入界面）" : "（点麦克风不会有反应）")
+                .append('\n');
 
         int segs = RootRelaySource.segmentCount();
         long size = RootRelaySource.newestSize();
