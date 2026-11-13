@@ -237,51 +237,33 @@ public class LocalRecognitionService extends RecognitionService {
             int len = Math.max(0, e - s);
             Log.i(TAG, "trim " + s + ".." + e + " => " + (len / 16) + "ms");
 
-            // ---- 第一步：在线识别（带预算，超时就放弃） ----
-            final short[] clip = pcm;
-            final int clipStart = s, clipLen = len;
-            final String[] cloudText = new String[1];
-            final Throwable[] cloudErr = new Throwable[1];
-            final boolean[] cloudDone = new boolean[1];
-            Thread cloudThread = null;
+            // ---- 第一步：在线识别（双模型竞速，内部有预算） ----
+            // 人声门限：噪声、电视外放常常能过基础阈值，但送进云端会被"听"成词。
+            // 实测真人说话 peak≈137~217 / 底噪 15~18；电视外放 peak≈71 / 底噪 60。
+            boolean strong = peakRms >= Math.max(110f, baseline * 4f);
+            Log.i(TAG, "voice gate: peak=" + peakRms + " baseline=" + baseline + " strong=" + strong);
 
-            if (CloudAsr.available()) {
-                cloudThread = new Thread(() -> {
-                    try {
-                        long t0 = System.currentTimeMillis();
-                        cloudText[0] = CloudAsr.transcribe(clip, clipStart, clipLen, CLOUD_READ_TIMEOUT_MS);
-                        Log.i(TAG, "cloud ok in " + (System.currentTimeMillis() - t0)
-                                + "ms: '" + cloudText[0] + "'");
-                    } catch (Throwable err) {
-                        cloudErr[0] = err;
-                        Log.w(TAG, "cloud failed: " + err.getMessage());
-                    } finally {
-                        synchronized (cloudDone) {
-                            cloudDone[0] = true;
-                            cloudDone.notifyAll();
-                        }
-                    }
-                }, "cloud-asr");
-                cloudThread.setDaemon(true);
-                cloudThread.start();
-
-                synchronized (cloudDone) {
-                    long deadline = System.currentTimeMillis() + CLOUD_BUDGET_MS;
-                    while (!cloudDone[0]) {
-                        long left = deadline - System.currentTimeMillis();
-                        if (left <= 0) break;
-                        try {
-                            cloudDone.wait(left);
-                        } catch (InterruptedException ignored) { }
-                    }
-                }
-            } else {
+            String text = null;
+            boolean cloudTried = false;
+            if (!strong) {
+                Log.i(TAG, "人声不够强，跳过云端，只用本地");
+            } else if (!CloudAsr.available()) {
                 Log.i(TAG, "no api key, 直接走本地 Vosk");
+            } else {
+                cloudTried = true;
+                long t0 = System.currentTimeMillis();
+                try {
+                    text = CloudAsr.transcribeSmart(pcm, s, len, CLOUD_BUDGET_MS);
+                    Log.i(TAG, "cloud total " + (System.currentTimeMillis() - t0) + "ms: '" + text + "'");
+                } catch (Throwable cloudError) {
+                    Log.w(TAG, "云端不可用（" + cloudError.getMessage() + "），回退本地 Vosk");
+                    text = null;
+                }
             }
 
-            if (cloudText[0] != null) {
+            if (text != null) {
                 // 云端明确返回（空串表示确实没说话），不再重复跑本地
-                String clean = tidy(cloudText[0]);
+                String clean = tidy(text);
                 if (clean.isEmpty()) {
                     Log.w(TAG, "cloud returned empty -> 没听到内容");
                     fail(listener, SpeechRecognizer.ERROR_NO_MATCH);
@@ -290,14 +272,9 @@ public class LocalRecognitionService extends RecognitionService {
                 }
                 return;
             }
-            if (cloudErr[0] != null) {
-                Log.w(TAG, "回退本地 Vosk（云端异常）");
-            } else if (cloudThread != null) {
-                Log.w(TAG, "云端超过 " + CLOUD_BUDGET_MS + "ms 未返回，回退本地 Vosk");
-            }
 
-            // ---- 第二步：本地 Vosk 兜底；云端已在跑时不再刷中间结果，避免闪字 ----
-            String local = runLocal(pcm, s, len, cloudThread == null ? listener : null);
+            // ---- 第二步：本地 Vosk 兜底；云端已参与时不再刷中间结果，避免闪字 ----
+            String local = runLocal(pcm, s, len, cloudTried ? null : listener);
             if (local != null && !local.isEmpty()) {
                 finish(listener, local);
             } else {
