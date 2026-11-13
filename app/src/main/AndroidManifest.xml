@@ -49,11 +49,18 @@
         </activity>
 
         <!-- 关键 2：以标准语音识别服务的身份注册，供上面的界面（以及任何用
-             SpeechRecognizer 的应用）绑定。 -->
+             SpeechRecognizer 的应用）绑定。
+
+             注意：这里【不能】声明 android:permission="android.permission.BIND_RECOGNITION_SERVICE"。
+             那是 signature|privileged 级权限，只有系统应用（比如 Google 语音服务）持有。
+             SmartTube 是普通应用，uid 10034，一旦我们要求这个权限，
+             系统会直接抛 SecurityException（实测日志：
+             "Permission Denial: ... requires android.permission.BIND_RECOGNITION_SERVICE"
+             "Not allowed to bind to service ... at SpeechRecognizer.startListening"），
+             SmartTube 又会把异常吞掉，表现就是点麦克风毫无反应。 -->
         <service
             android:name=".LocalRecognitionService"
-            android:exported="true"
-            android:permission="android.permission.BIND_RECOGNITION_SERVICE">
+            android:exported="true">
             <intent-filter>
                 <action android:name="android.speech.RecognitionService" />
             </intent-filter>
