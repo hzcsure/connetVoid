@@ -39,7 +39,7 @@ public class LocalRecognitionService extends RecognitionService {
     private static final long WAIT_FIRST_MS = 10000L;   // 还没开口时最多等多久
     private static final long MIN_SPEECH_MS = 600L;     // 至少录这么久才允许因静音结束
     private static final long MAX_TOTAL_MS = 20000L;    // 单次识别上限
-    private static final float VOICE_MIN_RMS = 60f;     // 绝对下限（实测底噪 ~13~30）
+    private static final float VOICE_MIN_RMS = 45f;     // 绝对下限（实测底噪 ~14，说话 ~120 以上）
     private static final float VOICE_RATIO = 2.5f;      // 相对底噪的倍数
     // PDM 麦克风电平很低（说话 RMS 约 250，满量程 32768，约 -42dBFS），
     // Vosk 的声学模型按正常录音电平训练，直接喂低电平几乎必然识别失败，
@@ -52,6 +52,7 @@ public class LocalRecognitionService extends RecognitionService {
     private final Handler main = new Handler(Looper.getMainLooper());
     private volatile Model model;
     private volatile boolean listening;
+    private int sourceRate = SAMPLE_RATE;
     private Thread worker;
 
     @Override
@@ -117,17 +118,19 @@ public class LocalRecognitionService extends RecognitionService {
                 model = m;
                 Log.i(TAG, "model loaded in " + (System.currentTimeMillis() - t0) + "ms");
             }
-            rec = new Recognizer(m, SAMPLE_RATE);
-
             src = openSource(listener);
             if (src == null) return;
+
+            // 中继是 48k，AudioRecord 是 16k，识别器要跟着实际音源走
+            rec = new Recognizer(m, sourceRate);
+            Log.i(TAG, "recognizer sampleRate=" + sourceRate);
 
             main.post(() -> {
                 try { listener.readyForSpeech(null); } catch (Throwable ignored) { }
                 try { listener.beginningOfSpeech(); } catch (Throwable ignored) { }
             });
 
-            byte[] buf = new byte[3200]; // ~100ms @16k/16bit/mono
+            byte[] buf = new byte[(sourceRate / 10) * 2]; // 每块约 100ms 单声道 16bit
             long start = System.currentTimeMillis();
             long lastVoice = start;
             long lastPartial = 0L;
@@ -247,7 +250,7 @@ public class LocalRecognitionService extends RecognitionService {
     static final class PcmDump {
         private final java.io.FileOutputStream out;
         private int written;
-        private static final int LIMIT = 16000 * 2 * 30; // 最多 30 秒
+        private static final int LIMIT = 48000 * 2 * 30; // 最多 30 秒（按 48k 单声道算）
 
         private PcmDump(java.io.File f) throws java.io.IOException {
             out = new java.io.FileOutputStream(f, false);
@@ -279,10 +282,13 @@ public class LocalRecognitionService extends RecognitionService {
 
     /** 优先用 root 中继；不可用时退回 AudioRecord。 */
     private PcmSource openSource(final Callback listener) {
+        sourceRate = SAMPLE_RATE;
         if (RootRelaySource.available()) {
             RootRelaySource relay = new RootRelaySource();
             if (relay.open()) {
-                Log.i(TAG, "using root relay, segments=" + RootRelaySource.segmentCount());
+                sourceRate = RootRelaySource.RATE;
+                Log.i(TAG, "using root relay, segments=" + RootRelaySource.segmentCount()
+                        + " rate=" + sourceRate);
                 return relay;
             }
             Log.w(TAG, "relay present but open failed");
