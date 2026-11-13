@@ -24,31 +24,38 @@ import java.util.Collections;
 
 /**
  * 以标准 android.speech.RecognitionService 身份运行。
- * SmartTube 点击麦克风 -> 系统绑定本服务 -> 取音频 -> Vosk 离线识别 -> 回传文本。
+ * SmartTube 点击麦克风 -> 系统绑定本服务 -> 取音频 -> 识别 -> 回传文本。
+ *
+ * 识别策略（v1.4 起）：**在线优先，本地兜底**
+ *   1. 先说一句"人话"给硅基流动 SenseVoice（0.6~0.9 秒返回，准确率远高于本地小模型）；
+ *   2. 网络异常 / 超时 / 没有 Key 时，自动回退本地 Vosk 离线识别，保证断网也能用。
  *
  * 音频来源有两种，优先级从高到低：
  *   1. root 中继（RootRelaySource）：这台电视的系统 HAL 不给 app 真麦克风数据，
  *      只能由 root 从 PDM 通道采集后经 /sdcard/voice 中继过来；
- *   2. AudioRecord：其它设备上的常规路径，本机大概率只能拿到全零。
+ *   2. AudioRecord：其它设备上的常规路径，本机只能拿到全零。
  */
 public class LocalRecognitionService extends RecognitionService {
 
     private static final String TAG = "VoskRec";
-    private static final int SAMPLE_RATE = 16000;
-    private static final long END_SILENCE_MS = 1800L;   // 说完后静音多久判定结束
-    private static final long WAIT_FIRST_MS = 10000L;   // 还没开口时最多等多久
-    private static final long MIN_SPEECH_MS = 600L;     // 至少录这么久才允许因静音结束
-    private static final long MAX_TOTAL_MS = 20000L;    // 单次识别上限
-    private static final float VOICE_MIN_RMS = 45f;     // 绝对下限（实测底噪 ~14，说话 ~120 以上）
-    private static final float VOICE_RATIO = 2.5f;      // 相对底噪的倍数
-    // PDM 麦克风电平很低（说话 RMS 约 250，满量程 32768，约 -42dBFS），
-    // Vosk 的声学模型按正常录音电平训练，直接喂低电平几乎必然识别失败，
-    // 因此按语音电平自适应放大到 -20dBFS 左右。
-    private static final float TARGET_RMS = 5000f;   // 实测目标电平：Vosk 对偏小的输入很敏感
+    private static final int SAMPLE_RATE = 16000;        // 上传/识别统一用 16k
+    private static final long END_SILENCE_MS = 1500L;    // 说完后静音多久判定结束（云端快，可更短）
+    private static final long WAIT_FIRST_MS = 10000L;    // 还没开口时最多等多久
+    private static final long MIN_SPEECH_MS = 600L;      // 至少录这么久才允许因静音结束
+    private static final long MAX_TOTAL_MS = 20000L;     // 单次识别上限
+    private static final int MAX_SAMPLES = 20 * SAMPLE_RATE;
+    private static final int PAD_SAMPLES = SAMPLE_RATE / 2;   // 前后各留 0.5 秒余量
+    private static final int CLOUD_TIMEOUT_MS = 6000;
+
+    // 本地兜底路径（Vosk）用的参数：这条麦克风电平很低，必须放大到正常录音电平，
+    // 并压掉 100-300Hz 的隆隆声（实测占能量 44%）。
+    private static final float VOICE_MIN_RMS = 45f;
+    private static final float VOICE_RATIO = 2.5f;
+    private static final float TARGET_RMS = 5000f;
     private static final float MIN_GAIN = 1.0f;
     private static final float MAX_GAIN = 40.0f;
-    private static final float SPEECH_FLOOR = 80f;      // 电平估计下限，避免把静音放大成噪声
-    private static final float GATE_LOW = 0.60f;        // 非语音段的压制系数（向下扩展）
+    private static final float SPEECH_FLOOR = 80f;
+    private static final float GATE_LOW = 0.60f;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private volatile Model model;
@@ -60,10 +67,10 @@ public class LocalRecognitionService extends RecognitionService {
     protected void onStartListening(Intent recognizerIntent, Callback listener) {
         String lang = recognizerIntent == null ? "?" :
                 recognizerIntent.getStringExtra(RecognizerIntent.EXTRA_LANGUAGE);
-        Log.i(TAG, "onStartListening lang=" + lang);
+        Log.i(TAG, "onStartListening lang=" + lang + " cloud=" + CloudAsr.keyHint());
         stopWorker();
         listening = true;
-        worker = new Thread(() -> recognize(listener), "vosk-recognize");
+        worker = new Thread(() -> recognize(listener), "voice-recognize");
         worker.start();
     }
 
@@ -100,59 +107,34 @@ public class LocalRecognitionService extends RecognitionService {
     }
 
     private void recognize(final Callback listener) {
-        File dir = ModelInstaller.ensureModel(this);
-        if (dir == null) {
-            Log.e(TAG, "model unavailable");
-            fail(listener, SpeechRecognizer.ERROR_CLIENT);
-            return;
-        }
-
         PcmSource src = null;
-        Recognizer rec = null;
-        PcmDump dump = null;
         PcmDump rawDump = null;
         try {
-            Model m = model;
-            if (m == null) {
-                Log.i(TAG, "loading model: " + dir);
-                long t0 = System.currentTimeMillis();
-                m = new Model(dir.getAbsolutePath());
-                model = m;
-                Log.i(TAG, "model loaded in " + (System.currentTimeMillis() - t0) + "ms");
-            }
             src = openSource(listener);
             if (src == null) return;
 
-            // 中继是 48k，AudioRecord 是 16k，识别器要跟着实际音源走
-            rec = new Recognizer(m, sourceRate);
-            Log.i(TAG, "recognizer sampleRate=" + sourceRate);
+            final int rate = sourceRate;
+            // 48k -> 16k：先低通再每 3 个取 1 个，避免混叠
+            final int factor = (rate % SAMPLE_RATE == 0) ? rate / SAMPLE_RATE : 1;
+            final Decimator dec = factor > 1 ? new Decimator(factor, rate) : null;
 
             main.post(() -> {
                 try { listener.readyForSpeech(null); } catch (Throwable ignored) { }
                 try { listener.beginningOfSpeech(); } catch (Throwable ignored) { }
             });
 
-            byte[] buf = new byte[(sourceRate / 10) * 2]; // 每块约 100ms 单声道 16bit
+            short[] pcm = new short[MAX_SAMPLES];
+            int count = 0;
+            int firstVoiceAt = -1;
+            int lastVoiceAt = -1;
+
+            byte[] buf = new byte[(rate / 10) * 2];  // 每块约 100ms 单声道 16bit
             long start = System.currentTimeMillis();
             long lastVoice = start;
-            long lastPartial = 0L;
             boolean anyVoice = false;
-            int totalRead = 0;
             float peakRms = 0f;
             float baseline = 0f;
             long zeroReads = 0;
-            float speechRms = 0f;      // 平滑后的语音电平估计，用于算增益
-            float gain = 8f;
-            float gate = 1f;           // 非语音段压制，避免把底噪放大后喂给识别器
-            String lastText = "";
-            // Vosk 每碰到一次停顿就会吐出一段结果。这里的搜索词常常被切成好几段
-            // （"周杰伦" -> "周" + "杰伦"），必须全部攒起来，否则只剩一个字。
-            StringBuilder collected = new StringBuilder();
-            // 实测这条麦克风 2kHz 以上几乎没能量，100-300Hz 占 44%，
-            // 300Hz 高通 + 4 阶，能把隆隆声压掉、让 Vosk 的倒谱特征更接近训练分布。
-            Biquad hpf1 = new Biquad(300f, sourceRate);
-            Biquad hpf2 = new Biquad(300f, sourceRate);
-            dump = PcmDump.open(this, "dbg_last.pcm");
             rawDump = PcmDump.open(this, "dbg_raw.pcm");
 
             while (listening) {
@@ -168,63 +150,34 @@ public class LocalRecognitionService extends RecognitionService {
                     continue;
                 }
                 zeroReads = 0;
-                totalRead += n;
-                if (rawDump != null) rawDump.write(buf, n);  // 原始音，留作离线调参
+                if (rawDump != null) rawDump.write(buf, n);
 
                 float rms = rms(buf, n);
                 if (baseline <= 0f) baseline = rms;
                 if (rms < baseline * 2f) baseline = baseline * 0.9f + rms * 0.1f;
                 float threshold = Math.max(VOICE_MIN_RMS, baseline * VOICE_RATIO);
-
                 boolean voiced = rms > threshold;
+
                 if (rms > peakRms) peakRms = rms;
                 if (voiced) {
                     lastVoice = System.currentTimeMillis();
                     anyVoice = true;
+                    if (firstVoiceAt < 0) firstVoiceAt = count;
                 }
 
-                // 自适应增益：跟住语音电平，噪声段不会把音量推到爆
-                float level = Math.max(speechRms, SPEECH_FLOOR);
-                speechRms = Math.max(speechRms * 0.85f, Math.min(rms, 8000f));
-                float want = TARGET_RMS / Math.max(level, SPEECH_FLOOR);
-                want = Math.min(Math.max(want, MIN_GAIN), MAX_GAIN);
-                // 快攻慢放：起音立刻放大，避免第一个字被压在低电平；回落慢慢来
-                if (want > gain) gain = want;
-                else gain = gain * 0.9f + want * 0.1f;
-                gate = gate * 0.7f + (voiced ? 1f : GATE_LOW) * 0.3f;
-
-                hpf1.process(buf, n);
-                hpf2.process(buf, n);
-                applyGain(buf, n, gain * gate);
-                if (dump != null) dump.write(buf, n);
-
-                if (rec.acceptWaveForm(buf, n)) {
-                    String text = extract(rec.getResult(), "text");
-                    if (text != null && !text.isEmpty()) {
-                        if (!anyVoice) {
-                            // 自适应增益会把底噪放大，Vosk 偶尔会对着噪声吐出字，
-                            // 没检测到人声时直接丢弃，避免"没人说话也搜出东西"
-                            Log.i(TAG, "ignore result without voice: " + text);
-                        } else {
-                            collected.append(' ').append(text);
-                            Log.i(TAG, "segment: " + text + " -> 累计:" + collected);
-                            publishPartial(listener, tidy(collected.toString()));
-                        }
-                    }
-                } else {
-                    long now = System.currentTimeMillis();
-                    if (now - lastPartial > 350) {
-                        lastPartial = now;
-                        String p = extract(rec.getPartialResult(), "partial");
-                        if (p != null && !p.isEmpty()) {
-                            lastText = p;
-                            publishPartial(listener, tidy(collected.toString() + " " + p));
-                        }
-                    }
+                int room = MAX_SAMPLES - count;
+                // 一个 100ms 块最多产出 1600 个样本，留够余量再写，避免越界
+                if (room >= 2048) {
+                    int added = (dec != null)
+                            ? dec.process(buf, n, pcm, count)
+                            : bytesToShorts(buf, n, pcm, count);
+                    if (added > room) added = room;
+                    count += added;
+                    if (voiced) lastVoiceAt = count;
                 }
 
                 long now = System.currentTimeMillis();
-                if (now - start > MAX_TOTAL_MS) {
+                if (now - start > MAX_TOTAL_MS || count >= MAX_SAMPLES) {
                     Log.i(TAG, "max duration reached, peakRms=" + peakRms);
                     break;
                 }
@@ -236,25 +189,57 @@ public class LocalRecognitionService extends RecognitionService {
                 }
             }
 
-            String tail = extract(rec.getFinalResult(), "text");
-            if (tail != null && !tail.isEmpty() && anyVoice) {
-                collected.append(' ').append(tail);
-            }
-            String text = anyVoice ? tidy(collected.toString()) : "";
-            Log.i(TAG, "final: '" + text + "' bytes=" + totalRead
-                    + " peakRms=" + peakRms + " baseline=" + baseline + " gain=" + gain);
-            if (text.isEmpty() && anyVoice && !lastText.isEmpty()) {
-                // 收尾结果为空时，用最后一条非空中间结果兜底
-                Log.i(TAG, "fallback to last partial: " + lastText);
-                text = tidy(lastText);
-            }
-            if (!text.isEmpty() && anyVoice) {
-                finish(listener, text);
-            } else if (!anyVoice) {
-                Log.w(TAG, "no voice detected, peakRms=" + peakRms + " threshold="
-                        + Math.max(VOICE_MIN_RMS, baseline * VOICE_RATIO));
+            listening = false;
+            Log.i(TAG, "capture done: " + count + " samples (" + (count / 16) + "ms)"
+                    + " anyVoice=" + anyVoice + " peakRms=" + peakRms + " baseline=" + baseline);
+
+            if (!anyVoice || count < SAMPLE_RATE / 4) {
+                Log.w(TAG, "no voice detected, peakRms=" + peakRms);
                 fail(listener, SpeechRecognizer.ERROR_SPEECH_TIMEOUT);
+                return;
+            }
+
+            int s = Math.max(0, firstVoiceAt - PAD_SAMPLES);
+            int e = Math.min(count, (lastVoiceAt > 0 ? lastVoiceAt : count) + PAD_SAMPLES);
+            int len = Math.max(0, e - s);
+            Log.i(TAG, "trim " + s + ".." + e + " => " + (len / 16) + "ms");
+
+            // ---- 第一步：在线识别 ----
+            String text = null;
+            boolean cloudTried = false;
+            if (CloudAsr.available()) {
+                cloudTried = true;
+                long t0 = System.currentTimeMillis();
+                try {
+                    text = CloudAsr.transcribe(pcm, s, len, CLOUD_TIMEOUT_MS);
+                    Log.i(TAG, "cloud ok in " + (System.currentTimeMillis() - t0) + "ms: '" + text + "'");
+                } catch (Throwable t) {
+                    Log.w(TAG, "cloud failed in " + (System.currentTimeMillis() - t0)
+                            + "ms: " + t.getMessage() + " -> 回退本地 Vosk");
+                    text = null;
+                }
             } else {
+                Log.i(TAG, "no api key, 直接走本地 Vosk");
+            }
+
+            if (text != null) {
+                // 云端明确返回（可能是空串：确实没人说话），不再重复跑本地
+                String clean = tidy(text);
+                if (clean.isEmpty()) {
+                    Log.w(TAG, "cloud returned empty");
+                    fail(listener, SpeechRecognizer.ERROR_NO_MATCH);
+                } else {
+                    finish(listener, clean);
+                }
+                return;
+            }
+
+            // ---- 第二步：本地 Vosk 兜底 ----
+            String local = runLocal(pcm, s, len, listener);
+            if (local != null && !local.isEmpty()) {
+                finish(listener, local);
+            } else {
+                Log.w(TAG, "local fallback also empty (cloudTried=" + cloudTried + ")");
                 fail(listener, SpeechRecognizer.ERROR_NO_MATCH);
             }
         } catch (Throwable t) {
@@ -262,22 +247,111 @@ public class LocalRecognitionService extends RecognitionService {
             fail(listener, SpeechRecognizer.ERROR_CLIENT);
         } finally {
             listening = false;
-            if (dump != null) dump.close();
             if (rawDump != null) rawDump.close();
             if (src != null) {
                 try { src.close(); } catch (Throwable ignored) { }
             }
+        }
+    }
+
+    /** 本地 Vosk 兜底：对已采好的 16k PCM 做高通 + 自适应增益，再喂识别器。 */
+    private String runLocal(short[] pcm, int start, int len, final Callback listener) {
+        Recognizer rec = null;
+        try {
+            File dir = ModelInstaller.ensureModel(this);
+            if (dir == null) {
+                Log.e(TAG, "model unavailable, cannot fallback");
+                return null;
+            }
+            Model m = model;
+            if (m == null) {
+                Log.i(TAG, "loading model: " + dir);
+                long t0 = System.currentTimeMillis();
+                m = new Model(dir.getAbsolutePath());
+                model = m;
+                Log.i(TAG, "model loaded in " + (System.currentTimeMillis() - t0) + "ms");
+            }
+            rec = new Recognizer(m, SAMPLE_RATE);
+
+            Biquad hpf1 = new Biquad(300f, SAMPLE_RATE);
+            Biquad hpf2 = new Biquad(300f, SAMPLE_RATE);
+            StringBuilder collected = new StringBuilder();
+            String lastPartial = "";
+
+            int block = SAMPLE_RATE / 10;
+            byte[] blk = new byte[block * 2];
+            float speechRms = 0f;
+            float gain = 8f;
+            float gate = 1f;
+            float baseline = 0f;
+            long lastPub = 0;
+
+            for (int off = 0; off < len; off += block) {
+                int n = Math.min(block, len - off);
+                for (int i = 0; i < n; i++) {
+                    short v = pcm[start + off + i];
+                    blk[i * 2] = (byte) (v & 0xff);
+                    blk[i * 2 + 1] = (byte) ((v >> 8) & 0xff);
+                }
+                int bytes = n * 2;
+                float rms = rms(blk, bytes);
+                if (baseline <= 0f) baseline = rms;
+                if (rms < baseline * 2f) baseline = baseline * 0.9f + rms * 0.1f;
+                boolean voiced = rms > Math.max(VOICE_MIN_RMS, baseline * VOICE_RATIO);
+
+                float level = Math.max(speechRms, SPEECH_FLOOR);
+                speechRms = Math.max(speechRms * 0.85f, Math.min(rms, 8000f));
+                float want = TARGET_RMS / Math.max(level, SPEECH_FLOOR);
+                want = Math.min(Math.max(want, MIN_GAIN), MAX_GAIN);
+                if (want > gain) gain = want;
+                else gain = gain * 0.9f + want * 0.1f;
+                gate = gate * 0.7f + (voiced ? 1f : GATE_LOW) * 0.3f;
+
+                hpf1.process(blk, bytes);
+                hpf2.process(blk, bytes);
+                applyGain(blk, bytes, gain * gate);
+
+                if (rec.acceptWaveForm(blk, bytes)) {
+                    String t = extract(rec.getResult(), "text");
+                    if (t != null && !t.isEmpty()) {
+                        collected.append(' ').append(t);
+                        Log.i(TAG, "local segment: " + t + " -> " + tidy(collected.toString()));
+                        publishPartial(listener, tidy(collected.toString()));
+                    }
+                } else {
+                    long now = System.currentTimeMillis();
+                    if (now - lastPub > 400) {
+                        lastPub = now;
+                        String p = extract(rec.getPartialResult(), "partial");
+                        if (p != null && !p.isEmpty()) {
+                            lastPartial = p;
+                            publishPartial(listener, tidy(collected + " " + p));
+                        }
+                    }
+                }
+            }
+
+            String tail = extract(rec.getFinalResult(), "text");
+            if (tail != null && !tail.isEmpty()) collected.append(' ').append(tail);
+            String text = tidy(collected.toString());
+            if (text.isEmpty() && !lastPartial.isEmpty()) text = tidy(lastPartial);
+            Log.i(TAG, "local final: '" + text + "'");
+            return text;
+        } catch (Throwable t) {
+            Log.e(TAG, "local fallback failed", t);
+            return null;
+        } finally {
             if (rec != null) {
                 try { rec.close(); } catch (Throwable ignored) { }
             }
         }
     }
 
-    /** 把实际送进 Vosk 的 PCM 落盘，便于事后核对音质（存在 app 外部私有目录）。 */
+    /** 把实际采集的 PCM 落盘，便于事后核对音质（存在 app 外部私有目录）。 */
     static final class PcmDump {
         private final java.io.FileOutputStream out;
         private int written;
-        private static final int LIMIT = 48000 * 2 * 30; // 最多 30 秒（按 48k 单声道算）
+        private static final int LIMIT = 48000 * 2 * 30;
 
         private PcmDump(java.io.File f) throws java.io.IOException {
             out = new java.io.FileOutputStream(f, false);
@@ -407,6 +481,14 @@ public class LocalRecognitionService extends RecognitionService {
         });
     }
 
+    private static int bytesToShorts(byte[] data, int len, short[] dst, int pos) {
+        int n = len / 2;
+        for (int i = 0; i < n; i++) {
+            dst[pos + i] = (short) ((data[i * 2] & 0xff) | (data[i * 2 + 1] << 8));
+        }
+        return n;
+    }
+
     private static float rms(byte[] data, int len) {
         int count = len / 2;
         if (count == 0) return 0f;
@@ -438,6 +520,49 @@ public class LocalRecognitionService extends RecognitionService {
             if (t.charAt(i) >= 0x4E00 && t.charAt(i) <= 0x9FFF) { cjk = true; break; }
         }
         return cjk ? t.replace(" ", "") : t;
+    }
+
+    /**
+     * 降采样：先做 4 阶低通（7kHz）再每 factor 个取 1 个。
+     * 直接抽样会把 8k 以上的能量折回到语音带里变成噪声。
+     */
+    static final class Decimator {
+        private final int factor;
+        private final float b0, b1, b2, a1, a2;
+        private float x1, x2, y1, y2;
+        private int phase;
+
+        Decimator(int factor, int rate) {
+            this.factor = factor;
+            double fc = 7000.0;
+            double w0 = 2 * Math.PI * fc / rate;
+            double cw = Math.cos(w0), sw = Math.sin(w0);
+            double alpha = sw / (2 * 0.707);
+            double a0 = 1 + alpha;
+            b0 = (float) ((1 - cw) / 2 / a0);
+            b1 = (float) ((1 - cw) / a0);
+            b2 = b0;
+            a1 = (float) (-2 * cw / a0);
+            a2 = (float) ((1 - alpha) / a0);
+        }
+
+        int process(byte[] data, int len, short[] dst, int pos) {
+            int w = 0;
+            for (int i = 0; i + 1 < len; i += 2) {
+                float x = (short) ((data[i] & 0xff) | (data[i + 1] << 8));
+                float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+                x2 = x1; x1 = x;
+                y2 = y1; y1 = y;
+                if (phase == 0) {
+                    int v = (int) y;
+                    if (v > 32767) v = 32767;
+                    else if (v < -32768) v = -32768;
+                    dst[pos + w++] = (short) v;
+                }
+                if (++phase >= factor) phase = 0;
+            }
+            return w;
+        }
     }
 
     /** 二阶高通（RBJ），去掉低频隆隆声，不吃 CPU。 */
