@@ -44,11 +44,11 @@ public class LocalRecognitionService extends RecognitionService {
     // PDM 麦克风电平很低（说话 RMS 约 250，满量程 32768，约 -42dBFS），
     // Vosk 的声学模型按正常录音电平训练，直接喂低电平几乎必然识别失败，
     // 因此按语音电平自适应放大到 -20dBFS 左右。
-    private static final float TARGET_RMS = 3200f;
+    private static final float TARGET_RMS = 5000f;   // 实测目标电平：Vosk 对偏小的输入很敏感
     private static final float MIN_GAIN = 1.0f;
     private static final float MAX_GAIN = 40.0f;
     private static final float SPEECH_FLOOR = 80f;      // 电平估计下限，避免把静音放大成噪声
-    private static final float GATE_LOW = 0.30f;        // 非语音段的压制系数（向下扩展）
+    private static final float GATE_LOW = 0.60f;        // 非语音段的压制系数（向下扩展）
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private volatile Model model;
@@ -148,7 +148,10 @@ public class LocalRecognitionService extends RecognitionService {
             // Vosk 每碰到一次停顿就会吐出一段结果。这里的搜索词常常被切成好几段
             // （"周杰伦" -> "周" + "杰伦"），必须全部攒起来，否则只剩一个字。
             StringBuilder collected = new StringBuilder();
-            Biquad hpf = new Biquad(90f, sourceRate);   // 去掉 90Hz 以下隆隆声
+            // 实测这条麦克风 2kHz 以上几乎没能量，100-300Hz 占 44%，
+            // 300Hz 高通 + 4 阶，能把隆隆声压掉、让 Vosk 的倒谱特征更接近训练分布。
+            Biquad hpf1 = new Biquad(300f, sourceRate);
+            Biquad hpf2 = new Biquad(300f, sourceRate);
             dump = PcmDump.open(this, "dbg_last.pcm");
             rawDump = PcmDump.open(this, "dbg_raw.pcm");
 
@@ -185,10 +188,13 @@ public class LocalRecognitionService extends RecognitionService {
                 speechRms = Math.max(speechRms * 0.85f, Math.min(rms, 8000f));
                 float want = TARGET_RMS / Math.max(level, SPEECH_FLOOR);
                 want = Math.min(Math.max(want, MIN_GAIN), MAX_GAIN);
-                gain = gain * 0.5f + want * 0.5f;
+                // 快攻慢放：起音立刻放大，避免第一个字被压在低电平；回落慢慢来
+                if (want > gain) gain = want;
+                else gain = gain * 0.9f + want * 0.1f;
                 gate = gate * 0.7f + (voiced ? 1f : GATE_LOW) * 0.3f;
 
-                hpf.process(buf, n);
+                hpf1.process(buf, n);
+                hpf2.process(buf, n);
                 applyGain(buf, n, gain * gate);
                 if (dump != null) dump.write(buf, n);
 
