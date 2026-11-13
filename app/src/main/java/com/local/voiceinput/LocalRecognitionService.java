@@ -39,9 +39,15 @@ public class LocalRecognitionService extends RecognitionService {
     private static final long WAIT_FIRST_MS = 10000L;   // 还没开口时最多等多久
     private static final long MIN_SPEECH_MS = 600L;     // 至少录这么久才允许因静音结束
     private static final long MAX_TOTAL_MS = 20000L;    // 单次识别上限
-    private static final float VOICE_MIN_RMS = 60f;     // 绝对下限（实测底噪 ~25）
+    private static final float VOICE_MIN_RMS = 60f;     // 绝对下限（实测底噪 ~13~30）
     private static final float VOICE_RATIO = 2.5f;      // 相对底噪的倍数
-    private static final float GAIN = 4.0f;             // PDM 电平偏低，送入 Vosk 前放大
+    // PDM 麦克风电平很低（说话 RMS 约 250，满量程 32768，约 -42dBFS），
+    // Vosk 的声学模型按正常录音电平训练，直接喂低电平几乎必然识别失败，
+    // 因此按语音电平自适应放大到 -20dBFS 左右。
+    private static final float TARGET_RMS = 3200f;
+    private static final float MIN_GAIN = 1.0f;
+    private static final float MAX_GAIN = 40.0f;
+    private static final float SPEECH_FLOOR = 80f;      // 电平估计下限，避免把静音放大成噪声
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private volatile Model model;
@@ -101,6 +107,7 @@ public class LocalRecognitionService extends RecognitionService {
 
         PcmSource src = null;
         Recognizer rec = null;
+        PcmDump dump = null;
         try {
             Model m = model;
             if (m == null) {
@@ -129,6 +136,10 @@ public class LocalRecognitionService extends RecognitionService {
             float peakRms = 0f;
             float baseline = 0f;
             long zeroReads = 0;
+            float speechRms = 0f;      // 平滑后的语音电平估计，用于算增益
+            float gain = 8f;
+            String lastText = "";
+            dump = PcmDump.open(this);
 
             while (listening) {
                 int n = src.read(buf, buf.length);
@@ -156,12 +167,20 @@ public class LocalRecognitionService extends RecognitionService {
                     anyVoice = true;
                 }
 
-                applyGain(buf, n, GAIN);
+                // 自适应增益：跟住语音电平，噪声段不会把音量推到爆
+                float level = Math.max(speechRms, SPEECH_FLOOR);
+                speechRms = Math.max(speechRms * 0.85f, Math.min(rms, 8000f));
+                float want = TARGET_RMS / Math.max(level, SPEECH_FLOOR);
+                want = Math.min(Math.max(want, MIN_GAIN), MAX_GAIN);
+                gain = gain * 0.5f + want * 0.5f;
+                applyGain(buf, n, gain);
+                if (dump != null) dump.write(buf, n);
 
                 if (rec.acceptWaveForm(buf, n)) {
                     String text = extract(rec.getResult(), "text");
                     if (text != null && !text.isEmpty()) {
-                        Log.i(TAG, "result: " + text + " peakRms=" + peakRms);
+                        Log.i(TAG, "result: " + text + " peakRms=" + peakRms
+                                + " gain=" + gain + " bytes=" + totalRead);
                         finish(listener, text);
                         return;
                     }
@@ -170,7 +189,10 @@ public class LocalRecognitionService extends RecognitionService {
                     if (now - lastPartial > 350) {
                         lastPartial = now;
                         String p = extract(rec.getPartialResult(), "partial");
-                        if (p != null && !p.isEmpty()) publishPartial(listener, p);
+                        if (p != null && !p.isEmpty()) {
+                            lastText = p;
+                            publishPartial(listener, p);
+                        }
                     }
                 }
 
@@ -189,7 +211,14 @@ public class LocalRecognitionService extends RecognitionService {
 
             String text = extract(rec.getFinalResult(), "text");
             Log.i(TAG, "final: '" + (text == null ? "" : text) + "' bytes=" + totalRead
-                    + " peakRms=" + peakRms + " baseline=" + baseline);
+                    + " peakRms=" + peakRms + " baseline=" + baseline + " gain=" + gain);
+            if (text == null || text.isEmpty()) {
+                // 收尾结果为空时，用最后一条非空中间结果兜底
+                if (!lastText.isEmpty()) {
+                    Log.i(TAG, "fallback to last partial: " + lastText);
+                    text = lastText;
+                }
+            }
             if (text != null && !text.isEmpty()) {
                 finish(listener, text);
             } else if (!anyVoice) {
@@ -204,12 +233,47 @@ public class LocalRecognitionService extends RecognitionService {
             fail(listener, SpeechRecognizer.ERROR_CLIENT);
         } finally {
             listening = false;
+            if (dump != null) dump.close();
             if (src != null) {
                 try { src.close(); } catch (Throwable ignored) { }
             }
             if (rec != null) {
                 try { rec.close(); } catch (Throwable ignored) { }
             }
+        }
+    }
+
+    /** 把实际送进 Vosk 的 PCM 落盘，便于事后核对音质（存在 app 外部私有目录）。 */
+    static final class PcmDump {
+        private final java.io.FileOutputStream out;
+        private int written;
+        private static final int LIMIT = 16000 * 2 * 30; // 最多 30 秒
+
+        private PcmDump(java.io.File f) throws java.io.IOException {
+            out = new java.io.FileOutputStream(f, false);
+        }
+
+        static PcmDump open(android.content.Context ctx) {
+            try {
+                java.io.File dir = ctx.getExternalFilesDir(null);
+                if (dir == null) return null;
+                return new PcmDump(new java.io.File(dir, "dbg_last.pcm"));
+            } catch (Throwable t) {
+                return null;
+            }
+        }
+
+        void write(byte[] b, int len) {
+            if (written >= LIMIT) return;
+            int use = Math.min(len, LIMIT - written);
+            try {
+                out.write(b, 0, use);
+                written += use;
+            } catch (Throwable ignored) { }
+        }
+
+        void close() {
+            try { out.close(); } catch (Throwable ignored) { }
         }
     }
 
