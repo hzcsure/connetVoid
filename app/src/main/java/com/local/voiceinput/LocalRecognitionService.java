@@ -160,6 +160,7 @@ public class LocalRecognitionService extends RecognitionService {
             int count = 0;
             int firstVoiceAt = -1;
             int lastVoiceAt = -1;
+            int voicedSamples = 0;   // 被判为人声的样本总量，用来区分「一句话」和「一声咔哒」
 
             byte[] buf = new byte[(rate / 10) * 2];  // 每块约 100ms 单声道 16bit
             long start = System.currentTimeMillis();
@@ -206,7 +207,10 @@ public class LocalRecognitionService extends RecognitionService {
                             : bytesToShorts(buf, n, pcm, count);
                     if (added > room) added = room;
                     count += added;
-                    if (voiced) lastVoiceAt = count;
+                    if (voiced) {
+                        lastVoiceAt = count;
+                        voicedSamples += added;
+                    }
                 }
 
                 long now = System.currentTimeMillis();
@@ -239,9 +243,15 @@ public class LocalRecognitionService extends RecognitionService {
 
             // ---- 第一步：在线识别（双模型竞速，内部有预算） ----
             // 人声门限：噪声、电视外放常常能过基础阈值，但送进云端会被"听"成词。
-            // 实测真人说话 peak≈137~217 / 底噪 15~18；电视外放 peak≈71 / 底噪 60。
-            boolean strong = peakRms >= Math.max(110f, baseline * 4f);
-            Log.i(TAG, "voice gate: peak=" + peakRms + " baseline=" + baseline + " strong=" + strong);
+            // 实测：正常说话 peak≈233/底噪≈17；小声说话 peak≈86/底噪≈26；
+            //       电视外放 peak≈71/底噪≈60（比值仅 1.2，靠相对量就能挡住）。
+            // 原先卡绝对值 110 太狠，把"小声说话"一起挡掉了（实测 23:35 那两次
+            // peak=79/86 就是真人在说，却被判成噪声）。现在改为
+            // 「至少是底噪的 2.5 倍」+「连续人声 ≥300ms」，一声咔哒过不了这两个条件。
+            int voicedMs = voicedSamples / 16;
+            boolean strong = peakRms >= Math.max(55f, baseline * 2.5f) && voicedMs >= 300;
+            Log.i(TAG, "voice gate: peak=" + peakRms + " baseline=" + baseline
+                    + " voicedMs=" + voicedMs + " strong=" + strong);
 
             String text = null;
             boolean cloudTried = false;
@@ -262,15 +272,14 @@ public class LocalRecognitionService extends RecognitionService {
             }
 
             if (text != null) {
-                // 云端明确返回（空串表示确实没说话），不再重复跑本地
                 String clean = tidy(text);
-                if (clean.isEmpty()) {
-                    Log.w(TAG, "cloud returned empty -> 没听到内容");
-                    fail(listener, SpeechRecognizer.ERROR_NO_MATCH);
-                } else {
+                if (!clean.isEmpty()) {
                     finish(listener, clean);
+                    return;
                 }
-                return;
+                // 云端说"没听到"，但本地模型未必同意（云端偶尔会漏掉小声的发音），
+                // 再给本地一次机会，总比直接回一句"没听到"强。
+                Log.w(TAG, "cloud returned empty -> 再试一次本地 Vosk");
             }
 
             // ---- 第二步：本地 Vosk 兜底；云端已参与时不再刷中间结果，避免闪字 ----
