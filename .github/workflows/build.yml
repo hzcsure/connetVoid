@@ -1,0 +1,52 @@
+name: build-apk
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 下载 Vosk 中文模型并放入 assets
+        run: |
+          set -e
+          MODEL=vosk-model-small-cn-0.22
+          curl -L --retry 3 --retry-delay 5 -o /tmp/$MODEL.zip \
+            https://alphacephei.com/vosk/models/$MODEL.zip
+          ls -lh /tmp/$MODEL.zip
+          mkdir -p /tmp/vosk
+          unzip -q /tmp/$MODEL.zip -d /tmp/vosk
+          mkdir -p app/src/main/assets/model
+          cp -r /tmp/vosk/$MODEL/. app/src/main/assets/model/
+          echo "--- 模型内容 ---"
+          du -sh app/src/main/assets/model
+          ls app/src/main/assets/model
+
+      - name: 准备 Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.7'
+
+      - name: 编译 Debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: tv-voice-input-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
