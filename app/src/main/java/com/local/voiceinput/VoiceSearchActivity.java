@@ -45,6 +45,7 @@ public class VoiceSearchActivity extends Activity {
     private SpeechRecognizer recognizer;
     private String lang = "zh-CN";
     private int attempt;
+    private int busyRetry;
     private boolean finished;
     private String lastPartial = "";
 
@@ -127,6 +128,17 @@ public class VoiceSearchActivity extends Activity {
         @Override
         public void onError(int error) {
             Log.w(TAG, "recognizer error=" + error + " attempt=" + attempt);
+            if (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
+                // 上一个识别会话还没彻底释放，等一下重来，不计入重试次数
+                busyRetry++;
+                if (busyRetry <= 3) {
+                    main.postDelayed(() -> {
+                        destroyRecognizer();
+                        startListening();
+                    }, 600L);
+                    return;
+                }
+            }
             if (isRetryable(error) && attempt < MAX_RETRY) {
                 attempt++;
                 main.post(() -> {
@@ -212,7 +224,8 @@ public class VoiceSearchActivity extends Activity {
             bodyView.setText(list.get(0));
             hintView.setText("");
         });
-        main.postDelayed(this::finish, 300);
+        // 停留一下让人看清识别成什么，再回给调用方
+        main.postDelayed(this::finish, 1200);
     }
 
     private void showFailure(int error) {
