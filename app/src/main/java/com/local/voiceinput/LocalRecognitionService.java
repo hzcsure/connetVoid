@@ -182,10 +182,16 @@ public class LocalRecognitionService extends RecognitionService {
                 if (rec.acceptWaveForm(buf, n)) {
                     String text = extract(rec.getResult(), "text");
                     if (text != null && !text.isEmpty()) {
-                        Log.i(TAG, "result: " + text + " peakRms=" + peakRms
-                                + " gain=" + gain + " bytes=" + totalRead);
-                        finish(listener, text);
-                        return;
+                        if (!anyVoice) {
+                            // 自适应增益会把底噪放大，Vosk 偶尔会对着噪声吐出字，
+                            // 没检测到人声时直接丢弃，避免"没人说话也搜出东西"
+                            Log.i(TAG, "ignore result without voice: " + text);
+                        } else {
+                            Log.i(TAG, "result: " + text + " peakRms=" + peakRms
+                                    + " gain=" + gain + " bytes=" + totalRead);
+                            finish(listener, text);
+                            return;
+                        }
                     }
                 } else {
                     long now = System.currentTimeMillis();
@@ -222,7 +228,7 @@ public class LocalRecognitionService extends RecognitionService {
                     text = lastText;
                 }
             }
-            if (text != null && !text.isEmpty()) {
+            if (text != null && !text.isEmpty() && anyVoice) {
                 finish(listener, text);
             } else if (!anyVoice) {
                 Log.w(TAG, "no voice detected, peakRms=" + peakRms + " threshold="
