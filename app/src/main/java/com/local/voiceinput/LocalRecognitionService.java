@@ -48,6 +48,7 @@ public class LocalRecognitionService extends RecognitionService {
     private static final float MIN_GAIN = 1.0f;
     private static final float MAX_GAIN = 40.0f;
     private static final float SPEECH_FLOOR = 80f;      // 电平估计下限，避免把静音放大成噪声
+    private static final float GATE_LOW = 0.30f;        // 非语音段的压制系数（向下扩展）
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private volatile Model model;
@@ -109,6 +110,7 @@ public class LocalRecognitionService extends RecognitionService {
         PcmSource src = null;
         Recognizer rec = null;
         PcmDump dump = null;
+        PcmDump rawDump = null;
         try {
             Model m = model;
             if (m == null) {
@@ -141,8 +143,14 @@ public class LocalRecognitionService extends RecognitionService {
             long zeroReads = 0;
             float speechRms = 0f;      // 平滑后的语音电平估计，用于算增益
             float gain = 8f;
+            float gate = 1f;           // 非语音段压制，避免把底噪放大后喂给识别器
             String lastText = "";
-            dump = PcmDump.open(this);
+            // Vosk 每碰到一次停顿就会吐出一段结果。这里的搜索词常常被切成好几段
+            // （"周杰伦" -> "周" + "杰伦"），必须全部攒起来，否则只剩一个字。
+            StringBuilder collected = new StringBuilder();
+            Biquad hpf = new Biquad(90f, sourceRate);   // 去掉 90Hz 以下隆隆声
+            dump = PcmDump.open(this, "dbg_last.pcm");
+            rawDump = PcmDump.open(this, "dbg_raw.pcm");
 
             while (listening) {
                 int n = src.read(buf, buf.length);
@@ -158,14 +166,16 @@ public class LocalRecognitionService extends RecognitionService {
                 }
                 zeroReads = 0;
                 totalRead += n;
+                if (rawDump != null) rawDump.write(buf, n);  // 原始音，留作离线调参
 
                 float rms = rms(buf, n);
                 if (baseline <= 0f) baseline = rms;
                 if (rms < baseline * 2f) baseline = baseline * 0.9f + rms * 0.1f;
                 float threshold = Math.max(VOICE_MIN_RMS, baseline * VOICE_RATIO);
 
+                boolean voiced = rms > threshold;
                 if (rms > peakRms) peakRms = rms;
-                if (rms > threshold) {
+                if (voiced) {
                     lastVoice = System.currentTimeMillis();
                     anyVoice = true;
                 }
@@ -176,7 +186,10 @@ public class LocalRecognitionService extends RecognitionService {
                 float want = TARGET_RMS / Math.max(level, SPEECH_FLOOR);
                 want = Math.min(Math.max(want, MIN_GAIN), MAX_GAIN);
                 gain = gain * 0.5f + want * 0.5f;
-                applyGain(buf, n, gain);
+                gate = gate * 0.7f + (voiced ? 1f : GATE_LOW) * 0.3f;
+
+                hpf.process(buf, n);
+                applyGain(buf, n, gain * gate);
                 if (dump != null) dump.write(buf, n);
 
                 if (rec.acceptWaveForm(buf, n)) {
@@ -187,10 +200,9 @@ public class LocalRecognitionService extends RecognitionService {
                             // 没检测到人声时直接丢弃，避免"没人说话也搜出东西"
                             Log.i(TAG, "ignore result without voice: " + text);
                         } else {
-                            Log.i(TAG, "result: " + text + " peakRms=" + peakRms
-                                    + " gain=" + gain + " bytes=" + totalRead);
-                            finish(listener, text);
-                            return;
+                            collected.append(' ').append(text);
+                            Log.i(TAG, "segment: " + text + " -> 累计:" + collected);
+                            publishPartial(listener, tidy(collected.toString()));
                         }
                     }
                 } else {
@@ -200,7 +212,7 @@ public class LocalRecognitionService extends RecognitionService {
                         String p = extract(rec.getPartialResult(), "partial");
                         if (p != null && !p.isEmpty()) {
                             lastText = p;
-                            publishPartial(listener, p);
+                            publishPartial(listener, tidy(collected.toString() + " " + p));
                         }
                     }
                 }
@@ -218,17 +230,19 @@ public class LocalRecognitionService extends RecognitionService {
                 }
             }
 
-            String text = extract(rec.getFinalResult(), "text");
-            Log.i(TAG, "final: '" + (text == null ? "" : text) + "' bytes=" + totalRead
-                    + " peakRms=" + peakRms + " baseline=" + baseline + " gain=" + gain);
-            if (text == null || text.isEmpty()) {
-                // 收尾结果为空时，用最后一条非空中间结果兜底
-                if (!lastText.isEmpty()) {
-                    Log.i(TAG, "fallback to last partial: " + lastText);
-                    text = lastText;
-                }
+            String tail = extract(rec.getFinalResult(), "text");
+            if (tail != null && !tail.isEmpty() && anyVoice) {
+                collected.append(' ').append(tail);
             }
-            if (text != null && !text.isEmpty() && anyVoice) {
+            String text = anyVoice ? tidy(collected.toString()) : "";
+            Log.i(TAG, "final: '" + text + "' bytes=" + totalRead
+                    + " peakRms=" + peakRms + " baseline=" + baseline + " gain=" + gain);
+            if (text.isEmpty() && anyVoice && !lastText.isEmpty()) {
+                // 收尾结果为空时，用最后一条非空中间结果兜底
+                Log.i(TAG, "fallback to last partial: " + lastText);
+                text = tidy(lastText);
+            }
+            if (!text.isEmpty() && anyVoice) {
                 finish(listener, text);
             } else if (!anyVoice) {
                 Log.w(TAG, "no voice detected, peakRms=" + peakRms + " threshold="
@@ -243,6 +257,7 @@ public class LocalRecognitionService extends RecognitionService {
         } finally {
             listening = false;
             if (dump != null) dump.close();
+            if (rawDump != null) rawDump.close();
             if (src != null) {
                 try { src.close(); } catch (Throwable ignored) { }
             }
@@ -262,11 +277,11 @@ public class LocalRecognitionService extends RecognitionService {
             out = new java.io.FileOutputStream(f, false);
         }
 
-        static PcmDump open(android.content.Context ctx) {
+        static PcmDump open(android.content.Context ctx, String name) {
             try {
                 java.io.File dir = ctx.getExternalFilesDir(null);
                 if (dir == null) return null;
-                return new PcmDump(new java.io.File(dir, "dbg_last.pcm"));
+                return new PcmDump(new java.io.File(dir, name));
             } catch (Throwable t) {
                 return null;
             }
@@ -405,6 +420,49 @@ public class LocalRecognitionService extends RecognitionService {
             else if (v < -32768) v = -32768;
             data[i] = (byte) (v & 0xff);
             data[i + 1] = (byte) ((v >> 8) & 0xff);
+        }
+    }
+
+    /** 整理识别文本：合并空白；中文结果把字间空格去掉。 */
+    static String tidy(String s) {
+        if (s == null) return "";
+        String t = s.trim().replaceAll("\\s+", " ");
+        boolean cjk = false;
+        for (int i = 0; i < t.length(); i++) {
+            if (t.charAt(i) >= 0x4E00 && t.charAt(i) <= 0x9FFF) { cjk = true; break; }
+        }
+        return cjk ? t.replace(" ", "") : t;
+    }
+
+    /** 二阶高通（RBJ），去掉低频隆隆声，不吃 CPU。 */
+    static final class Biquad {
+        private final float b0, b1, b2, a1, a2;
+        private float x1, x2, y1, y2;
+
+        Biquad(float fc, int rate) {
+            double w0 = 2 * Math.PI * fc / rate;
+            double cw = Math.cos(w0), sw = Math.sin(w0);
+            double alpha = sw / (2 * 0.707);
+            double a0 = 1 + alpha;
+            b0 = (float) ((1 + cw) / 2 / a0);
+            b1 = (float) (-(1 + cw) / a0);
+            b2 = b0;
+            a1 = (float) (-2 * cw / a0);
+            a2 = (float) ((1 - alpha) / a0);
+        }
+
+        void process(byte[] data, int len) {
+            for (int i = 0; i + 1 < len; i += 2) {
+                float x = (short) ((data[i] & 0xff) | (data[i + 1] << 8));
+                float y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+                x2 = x1; x1 = x;
+                y2 = y1; y1 = y;
+                int v = (int) y;
+                if (v > 32767) v = 32767;
+                else if (v < -32768) v = -32768;
+                data[i] = (byte) (v & 0xff);
+                data[i + 1] = (byte) ((v >> 8) & 0xff);
+            }
         }
     }
 
