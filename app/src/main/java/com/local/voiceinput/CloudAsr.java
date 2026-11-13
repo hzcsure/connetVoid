@@ -18,21 +18,26 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 /**
- * 硅基流动 SenseVoice 在线识别（OpenAI 风格的 multipart 上传）。
+ * 硅基流动在线识别（OpenAI 风格的 multipart 上传）。
  *
- * 实测（本机 + 电视）：7 秒音频 0.56~0.87 秒返回，静音段返回空串不乱出字，
- * "周杰伦 稻香" 能一次识别正确（本地 Vosk 会听成"的偶像"）。
+ * 同一份音频同时发给两个模型，谁先给出可信结果就用谁：
+ *   - SenseVoiceSmall  准确率高、静音返回空串不乱出字，但排队延迟 0.6~7 秒不稳定；
+ *   - TeleSpeechASR    延迟稳定在 1 秒，但静音段偶尔幻觉（会把噪声听成词）。
  *
- * 任何失败都抛 IOException，由 LocalRecognitionService 决定是否回退本地 Vosk。
+ * 策略：SenseVoice 回来了优先用它；它太慢时用 TeleSpeech 把延迟兜住。
+ * 任何异常都抛 IOException，由 LocalRecognitionService 决定是否回退本地 Vosk。
  */
 final class CloudAsr {
 
     static final String ENDPOINT = "https://api.siliconflow.cn/v1/audio/transcriptions";
-    static final String MODEL = "FunAudioLLM/SenseVoiceSmall";
-    /** Key 放在 /sdcard/voice/asr.key：重装 APK 不会丢，也不需要重新编译。 */
+    static final String MODEL_SENSE = "FunAudioLLM/SenseVoiceSmall";
+    static final String MODEL_TELE = "TeleAI/TeleSpeechASR";
+    /** Key 放在 /sdcard/voice/asr.key：重装 APK 不会丢，也不用重新编译。 */
     static final String KEY_FILE = "/sdcard/voice/asr.key";
 
     private static final String TAG = "VoskCloud";
+    /** TeleSpeech 先回来后，再多等 SenseVoice 这么久拿更准的结果。 */
+    private static final long SENSE_GRACE_MS = 700;
 
     private CloudAsr() { }
 
@@ -71,17 +76,92 @@ final class CloudAsr {
     }
 
     /**
-     * 上传 [offset, offset+count) 的 16k 单声道 PCM，返回识别文本（可能为空串）。
+     * 双模型竞速。返回识别文本（可能为空串表示确实没说话）；
+     * 两个都没在预算内给出结果时抛 IOException。
      */
-    static String transcribe(short[] pcm, int offset, int count, int timeoutMs) throws IOException {
+    static String transcribeSmart(short[] pcm, int offset, int count, int budgetMs) throws IOException {
         String key = apiKey();
         if (key == null) throw new IOException("没有 API Key");
 
         byte[] wav = wav(pcm, offset, count);
+        final Call sense = new Call(MODEL_SENSE, wav, key);
+        final Call tele = new Call(MODEL_TELE, wav, key);
+
+        long t0 = System.currentTimeMillis();
+        start(sense, budgetMs + 8000);
+        start(tele, budgetMs + 8000);
+
+        long deadline = t0 + budgetMs;
+        while (true) {
+            // 准确的那个已经给出结果（含空串=确实没说话），直接采用
+            if (sense.done && sense.text != null) break;
+            // 快但不那么准的那个回来了，稍等一会儿看准确的那个能不能赶上
+            if (tele.done && tele.text != null
+                    && System.currentTimeMillis() > tele.doneAt + SENSE_GRACE_MS) break;
+            if (System.currentTimeMillis() >= deadline) break;
+            sleep(40);
+        }
+        long cost = System.currentTimeMillis() - t0;
+        Log.i(TAG, "race " + cost + "ms sense=" + state(sense) + " tele=" + state(tele));
+
+        if (sense.done && sense.text != null) return sense.text;
+        if (tele.done && tele.text != null) return tele.text;
+        Throwable e = sense.error != null ? sense.error : tele.error;
+        throw new IOException(e != null ? String.valueOf(e.getMessage()) : "两个模型都没返回");
+    }
+
+    private static String state(Call c) {
+        if (!c.done) return "未完成";
+        if (c.error != null) return "失败";
+        String t = c.text == null ? "" : c.text;
+        return "'" + (t.length() > 12 ? t.substring(0, 12) + "…" : t) + "'";
+    }
+
+    private static void start(final Call c, final int timeoutMs) {
+        Thread t = new Thread(() -> c.run(timeoutMs), "cloud-" + c.model);
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private static void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException ignored) { }
+    }
+
+    /** 一次单模型请求。 */
+    private static final class Call {
+        final String model;
+        final byte[] wav;
+        final String key;
+        volatile String text;
+        volatile Throwable error;
+        volatile boolean done;
+        volatile long doneAt;
+
+        Call(String model, byte[] wav, String key) {
+            this.model = model;
+            this.wav = wav;
+            this.key = key;
+        }
+
+        void run(int timeoutMs) {
+            try {
+                text = post(wav, model, key, timeoutMs);
+                Log.i(TAG, model + " -> '" + text + "'");
+            } catch (Throwable t) {
+                error = t;
+                Log.w(TAG, model + " 失败: " + t.getMessage());
+            } finally {
+                doneAt = System.currentTimeMillis();
+                done = true;
+            }
+        }
+    }
+
+    private static String post(byte[] wav, String model, String key, int timeoutMs) throws IOException {
         String boundary = "----tvvoice" + System.nanoTime();
         byte[] head = ("--" + boundary + "\r\n"
                 + "Content-Disposition: form-data; name=\"model\"\r\n\r\n"
-                + MODEL + "\r\n"
+                + model + "\r\n"
                 + "--" + boundary + "\r\n"
                 + "Content-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n"
                 + "Content-Type: audio/wav\r\n\r\n").getBytes("UTF-8");
@@ -91,7 +171,7 @@ final class CloudAsr {
         try {
             c.setRequestMethod("POST");
             c.setDoOutput(true);
-            c.setConnectTimeout(Math.min(3000, timeoutMs));
+            c.setConnectTimeout(Math.min(2500, timeoutMs));
             c.setReadTimeout(Math.max(1000, timeoutMs));
             c.setRequestProperty("Authorization", "Bearer " + key);
             c.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary);
@@ -164,9 +244,5 @@ final class CloudAsr {
         if (s == null) return "";
         s = s.replace('\n', ' ').trim();
         return s.length() > 160 ? s.substring(0, 160) + "…" : s;
-    }
-
-    static void logConfig() {
-        Log.i(TAG, "cloud asr key=" + keyHint());
     }
 }
