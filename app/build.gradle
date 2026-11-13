@@ -10,11 +10,18 @@ android {
         applicationId "com.local.voiceinput"
         minSdk 23
         targetSdk 28
-        versionCode 4
-        versionName "1.3"
+        versionCode 5
+        versionName "1.4"
         ndk {
             abiFilters 'armeabi-v7a'
         }
+        // 在线识别的 Key 默认留空，运行期从 /sdcard/voice/asr.key 读取；
+        // 本地调试可用 -PASR_KEY=sk-xxx 直接编进包（不要提交到仓库）。
+        buildConfigField "String", "ASR_KEY", "\"${project.findProperty('ASR_KEY') ?: ''}\""
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 
     buildTypes {
