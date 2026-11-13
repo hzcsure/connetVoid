@@ -45,7 +45,13 @@ public class LocalRecognitionService extends RecognitionService {
     private static final long MAX_TOTAL_MS = 20000L;     // 单次识别上限
     private static final int MAX_SAMPLES = 20 * SAMPLE_RATE;
     private static final int PAD_SAMPLES = SAMPLE_RATE / 2;   // 前后各留 0.5 秒余量
-    private static final int CLOUD_TIMEOUT_MS = 6000;
+    /**
+     * 云端最多等这么久，超时就回退本地。
+     * 实测硅基流动的排队延迟波动很大（同一接口 0.6s ~ 21s），
+     * 语音搜索不能让人干等，所以卡一个上限，宁可给本地结果。
+     */
+    private static final int CLOUD_BUDGET_MS = 3500;
+    private static final int CLOUD_READ_TIMEOUT_MS = 9000;   // HTTP 自身超时，比预算宽，便于晚到也记账
 
     // 本地兜底路径（Vosk）用的参数：这条麦克风电平很低，必须放大到正常录音电平，
     // 并压掉 100-300Hz 的隆隆声（实测占能量 44%）。
@@ -58,10 +64,12 @@ public class LocalRecognitionService extends RecognitionService {
     private static final float GATE_LOW = 0.60f;
 
     private final Handler main = new Handler(Looper.getMainLooper());
+    private final Object modelLock = new Object();
     private volatile Model model;
     private volatile boolean listening;
     private int sourceRate = SAMPLE_RATE;
     private Thread worker;
+    private volatile Thread warmer;
 
     @Override
     protected void onStartListening(Intent recognizerIntent, Callback listener) {
@@ -70,8 +78,33 @@ public class LocalRecognitionService extends RecognitionService {
         Log.i(TAG, "onStartListening lang=" + lang + " cloud=" + CloudAsr.keyHint());
         stopWorker();
         listening = true;
+        warmUp();   // 趁用户还在说话，后台把本地模型加载好，兜底时几乎零等待
         worker = new Thread(() -> recognize(listener), "voice-recognize");
         worker.start();
+    }
+
+    /** 后台预热本地模型（解压 + 加载约 3 秒）。失败无所谓，只在回退时用到。 */
+    private void warmUp() {
+        if (model != null) return;
+        Thread t = warmer;
+        if (t != null && t.isAlive()) return;
+        Thread w = new Thread(() -> {
+            try {
+                File dir = ModelInstaller.ensureModel(this);
+                if (dir == null) return;
+                synchronized (modelLock) {
+                    if (model != null) return;
+                    long t0 = System.currentTimeMillis();
+                    model = new Model(dir.getAbsolutePath());
+                    Log.i(TAG, "model preloaded in " + (System.currentTimeMillis() - t0) + "ms");
+                }
+            } catch (Throwable e) {
+                Log.w(TAG, "model preload failed: " + e);
+            }
+        }, "vosk-warmup");
+        w.setDaemon(true);
+        warmer = w;
+        w.start();
     }
 
     @Override
@@ -204,42 +237,71 @@ public class LocalRecognitionService extends RecognitionService {
             int len = Math.max(0, e - s);
             Log.i(TAG, "trim " + s + ".." + e + " => " + (len / 16) + "ms");
 
-            // ---- 第一步：在线识别 ----
-            String text = null;
-            boolean cloudTried = false;
+            // ---- 第一步：在线识别（带预算，超时就放弃） ----
+            final short[] clip = pcm;
+            final int clipStart = s, clipLen = len;
+            final String[] cloudText = new String[1];
+            final Throwable[] cloudErr = new Throwable[1];
+            final boolean[] cloudDone = new boolean[1];
+            Thread cloudThread = null;
+
             if (CloudAsr.available()) {
-                cloudTried = true;
-                long t0 = System.currentTimeMillis();
-                try {
-                    text = CloudAsr.transcribe(pcm, s, len, CLOUD_TIMEOUT_MS);
-                    Log.i(TAG, "cloud ok in " + (System.currentTimeMillis() - t0) + "ms: '" + text + "'");
-                } catch (Throwable t) {
-                    Log.w(TAG, "cloud failed in " + (System.currentTimeMillis() - t0)
-                            + "ms: " + t.getMessage() + " -> 回退本地 Vosk");
-                    text = null;
+                cloudThread = new Thread(() -> {
+                    try {
+                        long t0 = System.currentTimeMillis();
+                        cloudText[0] = CloudAsr.transcribe(clip, clipStart, clipLen, CLOUD_READ_TIMEOUT_MS);
+                        Log.i(TAG, "cloud ok in " + (System.currentTimeMillis() - t0)
+                                + "ms: '" + cloudText[0] + "'");
+                    } catch (Throwable e) {
+                        cloudErr[0] = e;
+                        Log.w(TAG, "cloud failed: " + e.getMessage());
+                    } finally {
+                        synchronized (cloudDone) {
+                            cloudDone[0] = true;
+                            cloudDone.notifyAll();
+                        }
+                    }
+                }, "cloud-asr");
+                cloudThread.setDaemon(true);
+                cloudThread.start();
+
+                synchronized (cloudDone) {
+                    long deadline = System.currentTimeMillis() + CLOUD_BUDGET_MS;
+                    while (!cloudDone[0]) {
+                        long left = deadline - System.currentTimeMillis();
+                        if (left <= 0) break;
+                        try {
+                            cloudDone.wait(left);
+                        } catch (InterruptedException ignored) { }
+                    }
                 }
             } else {
                 Log.i(TAG, "no api key, 直接走本地 Vosk");
             }
 
-            if (text != null) {
-                // 云端明确返回（可能是空串：确实没人说话），不再重复跑本地
-                String clean = tidy(text);
+            if (cloudText[0] != null) {
+                // 云端明确返回（空串表示确实没说话），不再重复跑本地
+                String clean = tidy(cloudText[0]);
                 if (clean.isEmpty()) {
-                    Log.w(TAG, "cloud returned empty");
+                    Log.w(TAG, "cloud returned empty -> 没听到内容");
                     fail(listener, SpeechRecognizer.ERROR_NO_MATCH);
                 } else {
                     finish(listener, clean);
                 }
                 return;
             }
+            if (cloudErr[0] != null) {
+                Log.w(TAG, "回退本地 Vosk（云端异常）");
+            } else if (cloudThread != null) {
+                Log.w(TAG, "云端超过 " + CLOUD_BUDGET_MS + "ms 未返回，回退本地 Vosk");
+            }
 
-            // ---- 第二步：本地 Vosk 兜底 ----
-            String local = runLocal(pcm, s, len, listener);
+            // ---- 第二步：本地 Vosk 兜底；云端已在跑时不再刷中间结果，避免闪字 ----
+            String local = runLocal(pcm, s, len, cloudThread == null ? listener : null);
             if (local != null && !local.isEmpty()) {
                 finish(listener, local);
             } else {
-                Log.w(TAG, "local fallback also empty (cloudTried=" + cloudTried + ")");
+                Log.w(TAG, "local fallback also empty");
                 fail(listener, SpeechRecognizer.ERROR_NO_MATCH);
             }
         } catch (Throwable t) {
@@ -263,13 +325,16 @@ public class LocalRecognitionService extends RecognitionService {
                 Log.e(TAG, "model unavailable, cannot fallback");
                 return null;
             }
-            Model m = model;
-            if (m == null) {
-                Log.i(TAG, "loading model: " + dir);
-                long t0 = System.currentTimeMillis();
-                m = new Model(dir.getAbsolutePath());
-                model = m;
-                Log.i(TAG, "model loaded in " + (System.currentTimeMillis() - t0) + "ms");
+            Model m;
+            synchronized (modelLock) {
+                m = model;
+                if (m == null) {
+                    Log.i(TAG, "loading model: " + dir);
+                    long t0 = System.currentTimeMillis();
+                    m = new Model(dir.getAbsolutePath());
+                    model = m;
+                    Log.i(TAG, "model loaded in " + (System.currentTimeMillis() - t0) + "ms");
+                }
             }
             rec = new Recognizer(m, SAMPLE_RATE);
 
@@ -466,6 +531,7 @@ public class LocalRecognitionService extends RecognitionService {
     }
 
     private void publishPartial(final Callback listener, final String text) {
+        if (listener == null) return;
         final Bundle b = new Bundle();
         b.putStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION,
                 new ArrayList<>(Collections.singletonList(text)));
