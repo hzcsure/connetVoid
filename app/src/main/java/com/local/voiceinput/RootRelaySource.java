@@ -15,14 +15,17 @@ import java.util.Arrays;
  * 只有 root 通过 tinycap 打开 pcm3c 才拿得到，且只在 DSP（小爱）运行时供电。
  *
  * 中继约定：
- *   /sdcard/voice/seg_<序号>.wav   16kHz / 16bit / 立体声，声道 1 是麦克风
+ *   /sdcard/voice/seg_<序号>.wav   48kHz / 16bit / 立体声，声道 1 是麦克风
+ * 必须用 48k：tinycap 在 16k 上是劣质降采样，1kHz 以上几乎全被削掉，识别率极差；
+ * 48k 是 PDM 的原生时钟，频谱完整，Vosk 也能直接吃 48k。
  * 读取方式：跟最新的分段文件尾部（从"当前时刻"开始），文件增长就读新增部分，
- * 分段轮换时自动切到下一段，全程只输出单声道 16k PCM。
+ * 分段轮换时自动切到下一段，全程只输出单声道 PCM。
  */
 public class RootRelaySource implements PcmSource {
 
     private static final String TAG = "RootRelay";
     public static final File DIR = new File("/sdcard/voice");
+    public static final int RATE = 48000;      // 中继采样率，必须与 voice-daemon.sh 一致
     private static final int HEADER = 44;      // WAV 头
     private static final int FRAME = 4;        // 2 声道 × 16bit
     private static final int MIC_OFFSET = 2;   // 声道 1（右）是麦克风
