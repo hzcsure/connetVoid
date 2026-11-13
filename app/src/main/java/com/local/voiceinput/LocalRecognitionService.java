@@ -35,7 +35,8 @@ public class LocalRecognitionService extends RecognitionService {
 
     private static final String TAG = "VoskRec";
     private static final int SAMPLE_RATE = 16000;
-    private static final long END_SILENCE_MS = 1800L;   // 静音多久判定"说完了"
+    private static final long END_SILENCE_MS = 1800L;   // 说完后静音多久判定结束
+    private static final long WAIT_FIRST_MS = 10000L;   // 还没开口时最多等多久
     private static final long MIN_SPEECH_MS = 600L;     // 至少录这么久才允许因静音结束
     private static final long MAX_TOTAL_MS = 20000L;    // 单次识别上限
     private static final float VOICE_MIN_RMS = 60f;     // 绝对下限（实测底噪 ~25）
@@ -178,8 +179,10 @@ public class LocalRecognitionService extends RecognitionService {
                     Log.i(TAG, "max duration reached, peakRms=" + peakRms);
                     break;
                 }
-                if (now - lastVoice > END_SILENCE_MS && now - start > MIN_SPEECH_MS) {
-                    Log.i(TAG, "silence timeout, peakRms=" + peakRms);
+                // 还没开口：给足反应时间；已开口：按静音间隔收尾
+                long patience = anyVoice ? END_SILENCE_MS : WAIT_FIRST_MS;
+                if (now - lastVoice > patience && now - start > MIN_SPEECH_MS) {
+                    Log.i(TAG, "silence timeout, anyVoice=" + anyVoice + " peakRms=" + peakRms);
                     break;
                 }
             }
