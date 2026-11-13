@@ -186,7 +186,12 @@ public class MainActivity extends Activity {
 
         File dir = new File(getFilesDir(), "vosk-model");
         modelReady = new File(dir, ".extracted").exists();
-        sb.append("识别模型：").append(modelReady ? "就绪" : "未解压").append('\n');
+        sb.append("本地兜底模型：").append(modelReady ? "就绪" : "未解压（仅断网兜底用）").append('\n');
+
+        boolean cloud = CloudAsr.available();
+        sb.append("在线识别：").append(cloud ? "已配置 " + CloudAsr.keyHint() : "未配置（只走本地）")
+                .append(cloud ? "（SenseVoice，优先使用）" : "（把 key 放到 " + CloudAsr.KEY_FILE + "）")
+                .append('\n');
 
         boolean available = SpeechRecognizer.isRecognitionAvailable(this);
         sb.append("系统可发现本服务：").append(available ? "是" : "否").append('\n');
