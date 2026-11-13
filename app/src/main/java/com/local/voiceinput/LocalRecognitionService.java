@@ -10,7 +10,6 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.speech.RecognitionService;
-import android.speech.RecognizerIntent;
 import android.speech.SpeechRecognizer;
 import android.util.Log;
 
@@ -24,16 +23,23 @@ import java.util.Collections;
 
 /**
  * 以标准 android.speech.RecognitionService 身份运行。
- * SmartTube 点击麦克风 -> 系统绑定本服务 -> AudioRecord 录音 -> Vosk 离线识别 -> 回传文本。
+ * SmartTube 点击麦克风 -> 系统绑定本服务 -> 取音频 -> Vosk 离线识别 -> 回传文本。
+ *
+ * 音频来源有两种，优先级从高到低：
+ *   1. root 中继（RootRelaySource）：这台电视的系统 HAL 不给 app 真麦克风数据，
+ *      只能由 root 从 PDM 通道采集后经 /sdcard/voice 中继过来；
+ *   2. AudioRecord：其它设备上的常规路径，本机大概率只能拿到全零。
  */
 public class LocalRecognitionService extends RecognitionService {
 
     private static final String TAG = "VoskRec";
     private static final int SAMPLE_RATE = 16000;
-    private static final long END_SILENCE_MS = 2200L;   // 静音多久判定"说完了"
-    private static final long MIN_SPEECH_MS = 800L;    // 至少录这么久才允许因静音结束
-    private static final long MAX_TOTAL_MS = 20000L;   // 单次识别上限
-    private static final float VOICE_RMS = 380f;       // 16bit 满量程 32767
+    private static final long END_SILENCE_MS = 1800L;   // 静音多久判定"说完了"
+    private static final long MIN_SPEECH_MS = 600L;     // 至少录这么久才允许因静音结束
+    private static final long MAX_TOTAL_MS = 20000L;    // 单次识别上限
+    private static final float VOICE_MIN_RMS = 60f;     // 绝对下限（实测底噪 ~25）
+    private static final float VOICE_RATIO = 2.5f;      // 相对底噪的倍数
+    private static final float GAIN = 4.0f;             // PDM 电平偏低，送入 Vosk 前放大
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private volatile Model model;
@@ -43,7 +49,7 @@ public class LocalRecognitionService extends RecognitionService {
     @Override
     protected void onStartListening(Intent recognizerIntent, Callback listener) {
         String lang = recognizerIntent == null ? "?" :
-                recognizerIntent.getStringExtra(RecognizerIntent.EXTRA_LANGUAGE);
+                recognizerIntent.getStringExtra(Intent.EXTRA_LANGUAGE);
         Log.i(TAG, "onStartListening lang=" + lang);
         stopWorker();
         listening = true;
@@ -84,12 +90,6 @@ public class LocalRecognitionService extends RecognitionService {
     }
 
     private void recognize(final Callback listener) {
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            Log.e(TAG, "RECORD_AUDIO denied");
-            fail(listener, SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS);
-            return;
-        }
-
         File dir = ModelInstaller.ensureModel(this);
         if (dir == null) {
             Log.e(TAG, "model unavailable");
@@ -97,7 +97,7 @@ public class LocalRecognitionService extends RecognitionService {
             return;
         }
 
-        AudioRecord record = null;
+        PcmSource src = null;
         Recognizer rec = null;
         try {
             Model m = model;
@@ -110,38 +110,8 @@ public class LocalRecognitionService extends RecognitionService {
             }
             rec = new Recognizer(m, SAMPLE_RATE);
 
-            int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE,
-                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
-            int bufSize = Math.max(minBuf * 4, 16384);
-
-            int[] sources = new int[]{
-                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                    MediaRecorder.AudioSource.MIC
-            };
-            for (int src : sources) {
-                AudioRecord candidate = new AudioRecord(src, SAMPLE_RATE,
-                        AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize);
-                if (candidate.getState() == AudioRecord.STATE_INITIALIZED) {
-                    record = candidate;
-                    Log.i(TAG, "AudioRecord initialized, source=" + src + " buf=" + bufSize);
-                    break;
-                }
-                Log.w(TAG, "AudioRecord init failed for source=" + src);
-                candidate.release();
-            }
-            if (record == null) {
-                Log.e(TAG, "no AudioRecord available");
-                fail(listener, SpeechRecognizer.ERROR_AUDIO);
-                return;
-            }
-
-            record.startRecording();
-            if (record.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
-                Log.e(TAG, "startRecording failed");
-                fail(listener, SpeechRecognizer.ERROR_AUDIO);
-                return;
-            }
-            Log.i(TAG, "recording started");
+            src = openSource(listener);
+            if (src == null) return;
 
             main.post(() -> {
                 try { listener.readyForSpeech(null); } catch (Throwable ignored) { }
@@ -155,18 +125,36 @@ public class LocalRecognitionService extends RecognitionService {
             boolean anyVoice = false;
             int totalRead = 0;
             float peakRms = 0f;
+            float baseline = 0f;
+            long zeroReads = 0;
 
             while (listening) {
-                int n = record.read(buf, 0, buf.length);
-                if (n <= 0) continue;
+                int n = src.read(buf, buf.length);
+                if (n <= 0) {
+                    zeroReads++;
+                    if (zeroReads == 40) {
+                        // 连续 2 秒拿不到任何数据：多半是中继没跑起来
+                        Log.e(TAG, "audio source produced nothing for 2s");
+                        fail(listener, SpeechRecognizer.ERROR_AUDIO);
+                        return;
+                    }
+                    continue;
+                }
+                zeroReads = 0;
                 totalRead += n;
 
                 float rms = rms(buf, n);
+                if (baseline <= 0f) baseline = rms;
+                if (rms < baseline * 2f) baseline = baseline * 0.9f + rms * 0.1f;
+                float threshold = Math.max(VOICE_MIN_RMS, baseline * VOICE_RATIO);
+
                 if (rms > peakRms) peakRms = rms;
-                if (rms > VOICE_RMS) {
+                if (rms > threshold) {
                     lastVoice = System.currentTimeMillis();
                     anyVoice = true;
                 }
+
+                applyGain(buf, n, GAIN);
 
                 if (rec.acceptWaveForm(buf, n)) {
                     String text = extract(rec.getResult(), "text");
@@ -186,7 +174,7 @@ public class LocalRecognitionService extends RecognitionService {
 
                 long now = System.currentTimeMillis();
                 if (now - start > MAX_TOTAL_MS) {
-                    Log.i(TAG, "max duration reached");
+                    Log.i(TAG, "max duration reached, peakRms=" + peakRms);
                     break;
                 }
                 if (now - lastVoice > END_SILENCE_MS && now - start > MIN_SPEECH_MS) {
@@ -196,12 +184,13 @@ public class LocalRecognitionService extends RecognitionService {
             }
 
             String text = extract(rec.getFinalResult(), "text");
-            Log.i(TAG, "final: '" + (text == null ? "" : text) + "' bytes=" + totalRead + " peakRms=" + peakRms);
+            Log.i(TAG, "final: '" + (text == null ? "" : text) + "' bytes=" + totalRead
+                    + " peakRms=" + peakRms + " baseline=" + baseline);
             if (text != null && !text.isEmpty()) {
                 finish(listener, text);
             } else if (!anyVoice) {
-                // 全程无有效电平：多半是麦克风被别的进程占用 / 拿到了全零数据
-                Log.w(TAG, "no voice detected at all, peakRms=" + peakRms);
+                Log.w(TAG, "no voice detected, peakRms=" + peakRms + " threshold="
+                        + Math.max(VOICE_MIN_RMS, baseline * VOICE_RATIO));
                 fail(listener, SpeechRecognizer.ERROR_SPEECH_TIMEOUT);
             } else {
                 fail(listener, SpeechRecognizer.ERROR_NO_MATCH);
@@ -211,14 +200,82 @@ public class LocalRecognitionService extends RecognitionService {
             fail(listener, SpeechRecognizer.ERROR_CLIENT);
         } finally {
             listening = false;
-            if (record != null) {
-                try { record.stop(); } catch (Throwable ignored) { }
-                try { record.release(); } catch (Throwable ignored) { }
+            if (src != null) {
+                try { src.close(); } catch (Throwable ignored) { }
             }
             if (rec != null) {
                 try { rec.close(); } catch (Throwable ignored) { }
             }
         }
+    }
+
+    /** 优先用 root 中继；不可用时退回 AudioRecord。 */
+    private PcmSource openSource(final Callback listener) {
+        if (RootRelaySource.available()) {
+            RootRelaySource relay = new RootRelaySource();
+            if (relay.open()) {
+                Log.i(TAG, "using root relay, segments=" + RootRelaySource.segmentCount());
+                return relay;
+            }
+            Log.w(TAG, "relay present but open failed");
+        }
+        return openAudioRecord(listener);
+    }
+
+    private PcmSource openAudioRecord(final Callback listener) {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            Log.e(TAG, "RECORD_AUDIO denied");
+            fail(listener, SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS);
+            return null;
+        }
+
+        int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE,
+                AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
+        int bufSize = Math.max(minBuf * 4, 16384);
+
+        int[] sources = new int[]{
+                MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                MediaRecorder.AudioSource.MIC
+        };
+        AudioRecord record = null;
+        for (int s : sources) {
+            AudioRecord candidate = new AudioRecord(s, SAMPLE_RATE,
+                    AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, bufSize);
+            if (candidate.getState() == AudioRecord.STATE_INITIALIZED) {
+                record = candidate;
+                Log.i(TAG, "AudioRecord initialized, source=" + s);
+                break;
+            }
+            Log.w(TAG, "AudioRecord init failed for source=" + s);
+            candidate.release();
+        }
+        if (record == null) {
+            Log.e(TAG, "no AudioRecord available");
+            fail(listener, SpeechRecognizer.ERROR_AUDIO);
+            return null;
+        }
+
+        record.startRecording();
+        if (record.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
+            Log.e(TAG, "startRecording failed");
+            record.release();
+            fail(listener, SpeechRecognizer.ERROR_AUDIO);
+            return null;
+        }
+
+        final AudioRecord rec = record;
+        return new PcmSource() {
+            @Override
+            public int read(byte[] out, int maxBytes) {
+                return rec.read(out, 0, maxBytes);
+            }
+
+            @Override
+            public void close() {
+                try { rec.stop(); } catch (Throwable ignored) { }
+                try { rec.release(); } catch (Throwable ignored) { }
+            }
+        };
     }
 
     private void finish(final Callback listener, final String text) {
@@ -258,6 +315,17 @@ public class LocalRecognitionService extends RecognitionService {
             sum += (long) s * s;
         }
         return (float) Math.sqrt((double) sum / count);
+    }
+
+    private static void applyGain(byte[] data, int len, float gain) {
+        for (int i = 0; i + 1 < len; i += 2) {
+            int s = (short) ((data[i] & 0xff) | (data[i + 1] << 8));
+            int v = (int) (s * gain);
+            if (v > 32767) v = 32767;
+            else if (v < -32768) v = -32768;
+            data[i] = (byte) (v & 0xff);
+            data[i + 1] = (byte) ((v >> 8) & 0xff);
+        }
     }
 
     private static String extract(String json, String key) {

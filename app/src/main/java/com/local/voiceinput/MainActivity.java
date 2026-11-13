@@ -68,10 +68,19 @@ public class MainActivity extends Activity {
     }
 
     private void requestAudioPermission() {
-        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_AUDIO);
-        } else {
+        java.util.ArrayList<String> need = new java.util.ArrayList<>();
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+            need.add(Manifest.permission.RECORD_AUDIO);
+        }
+        if (checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+            need.add(Manifest.permission.READ_EXTERNAL_STORAGE);
+        }
+        if (need.isEmpty()) {
             refreshStatus();
+        } else {
+            requestPermissions(need.toArray(new String[0]), REQ_AUDIO);
         }
     }
 
@@ -144,6 +153,15 @@ public class MainActivity extends Activity {
 
         boolean available = SpeechRecognizer.isRecognitionAvailable(this);
         sb.append("系统可发现本服务：").append(available ? "是" : "否").append('\n');
+
+        int segs = RootRelaySource.segmentCount();
+        long size = RootRelaySource.newestSize();
+        boolean relay = RootRelaySource.available();
+        sb.append("root 中继：").append(relay ? "有数据" : "无（未启动采集）")
+                .append("  段数=").append(segs)
+                .append("  最新=").append(size / 1024).append("KB").append('\n');
+        sb.append("录音来源：").append(relay ? "root 中继（PDM 麦克风）" : "系统 AudioRecord")
+                .append('\n');
 
         sb.append("服务类：").append(LocalRecognitionService.class.getName());
         status.setText(sb.toString());
