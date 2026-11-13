@@ -252,9 +252,9 @@ public class LocalRecognitionService extends RecognitionService {
                         cloudText[0] = CloudAsr.transcribe(clip, clipStart, clipLen, CLOUD_READ_TIMEOUT_MS);
                         Log.i(TAG, "cloud ok in " + (System.currentTimeMillis() - t0)
                                 + "ms: '" + cloudText[0] + "'");
-                    } catch (Throwable e) {
-                        cloudErr[0] = e;
-                        Log.w(TAG, "cloud failed: " + e.getMessage());
+                    } catch (Throwable err) {
+                        cloudErr[0] = err;
+                        Log.w(TAG, "cloud failed: " + err.getMessage());
                     } finally {
                         synchronized (cloudDone) {
                             cloudDone[0] = true;
