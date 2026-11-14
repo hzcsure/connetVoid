@@ -421,9 +421,24 @@ public final class V2Ctl {
                     tally.put(sig, c == null ? 1 : c + 1);
                 }
 
+                // 保护当前选中节点：如果在删除名单里，保留它，改删它的副本
+                String sel = null;
+                try {
+                    Object sv = mm.getMethod("getSelectServer").invoke(inst);
+                    if (sv != null) {
+                        sel = String.valueOf(sv);
+                    }
+                } catch (Throwable ignored) {
+                }
+                if (sel != null && dups.contains(sel)) {
+                    dups.remove(sel);
+                    System.out.println("    [保护] 当前选中 " + sel + " 命中重复，保留它，改删副本");
+                }
+
                 grand += dups.size();
                 System.out.println("[组] " + sub + " 总 " + guids.size() + " / 重复 " + dups.size()
                         + " / 跳过复杂类型 " + complex + " / 无配置 " + noCfg);
+                System.out.println("    当前选中=" + sel);
                 int shown = 0;
                 for (java.util.Map.Entry<String, Integer> e : tally.entrySet()) {
                     if (shown++ >= 10) {
@@ -439,7 +454,13 @@ public final class V2Ctl {
                     mRemove.invoke(inst, dups, sub);
                     Object nl = mDecodeList.invoke(inst, sub);
                     int n = (nl instanceof java.util.List) ? ((java.util.List<?>) nl).size() : -1;
-                    System.out.println("    已删除，写后列表长度 = " + n);
+                    System.out.println("    已删除 " + dups.size() + " 个，写后列表长度 = " + n);
+                    Object sv2 = null;
+                    try {
+                        sv2 = mm.getMethod("getSelectServer").invoke(inst);
+                    } catch (Throwable ignored) {
+                    }
+                    System.out.println("    写后选中=" + sv2);
                 }
             }
             System.out.println((dryRun ? "DRY_RUN 可删重复=" : "DEDUP_DONE 已删重复=") + grand);
