@@ -139,31 +139,61 @@ public final class V2Ctl {
             Object am = stub.getMethod("asInterface", IBinder.class).invoke(null, binder);
             Class<?> iam = Class.forName("android.app.IActivityManager");
 
+            // 打印所有 start*Service* 签名，便于判断该 ROM 用的是哪一版
             for (Method m : iam.getMethods()) {
-                if (!"startServiceInPackage".equals(m.getName())) {
-                    continue;
+                String n = m.getName();
+                if (n.startsWith("startService") || n.startsWith("startDelegate")) {
+                    StringBuilder sb = new StringBuilder("  sig " + n + "(");
+                    Class<?>[] p = m.getParameterTypes();
+                    for (int i = 0; i < p.length; i++) {
+                        if (i > 0) sb.append(", ");
+                        sb.append(p[i].getSimpleName());
+                    }
+                    System.out.println(sb.append(")").toString());
                 }
-                Class<?>[] p = m.getParameterTypes();
-                Object[] a = new Object[p.length];
-                int si = 0;
-                for (int i = 0; i < p.length; i++) {
-                    if (p[i] == int.class) {
-                        a[i] = 0;
-                    } else if (p[i] == boolean.class) {
-                        a[i] = Boolean.TRUE;
-                    } else if (p[i] == Intent.class) {
-                        a[i] = it;
-                    } else if (p[i] == String.class) {
-                        a[i] = (si++ == 0) ? null : PKG;
-                    } else {
-                        a[i] = null;
+            }
+
+            String[] names = {"startServiceInPackage", "startService"};
+            for (String name : names) {
+                for (Method m : iam.getMethods()) {
+                    if (!name.equals(m.getName())) {
+                        continue;
+                    }
+                    Class<?>[] p = m.getParameterTypes();
+                    Object[] a = new Object[p.length];
+                    int si = 0;
+                    boolean fits = true;
+                    for (int i = 0; i < p.length; i++) {
+                        if (p[i] == int.class) {
+                            a[i] = 0;
+                        } else if (p[i] == boolean.class) {
+                            a[i] = Boolean.FALSE;
+                        } else if (p[i] == Intent.class) {
+                            a[i] = it;
+                        } else if (p[i] == String.class) {
+                            a[i] = (si++ == 0) ? null : PKG;
+                        } else if (p[i].isInterface()) {
+                            a[i] = null;
+                        } else {
+                            fits = false;
+                            break;
+                        }
+                    }
+                    if (!fits) {
+                        continue;
+                    }
+                    try {
+                        Object r = m.invoke(am, a);
+                        System.out.println(name + "/" + a.length + " -> " + r);
+                        return true;
+                    } catch (Throwable t) {
+                        Throwable c = (t instanceof java.lang.reflect.InvocationTargetException
+                                && t.getCause() != null) ? t.getCause() : t;
+                        System.out.println(name + "/" + a.length + " failed: " + c);
                     }
                 }
-                Object r = m.invoke(am, a);
-                System.out.println("startServiceInPackage(" + a.length + " args) -> " + r);
-                return true;
             }
-            System.out.println("startServiceInPackage not found");
+            System.out.println("no usable startService method");
         } catch (Throwable t) {
             System.out.println("AM path failed: " + t);
         }
@@ -179,7 +209,9 @@ public final class V2Ctl {
             System.out.println("ctx.startService -> " + r);
             return r != null;
         } catch (Throwable t) {
-            System.out.println("CTX path failed: " + t);
+            Throwable c = (t instanceof java.lang.reflect.InvocationTargetException
+                    && t.getCause() != null) ? t.getCause() : t;
+            System.out.println("CTX path failed: " + c);
         }
         return false;
     }
