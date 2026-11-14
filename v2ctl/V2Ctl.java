@@ -58,6 +58,12 @@ public final class V2Ctl {
                     .getConstructor(String.class, ClassLoader.class)
                     .newInstance(apk, ClassLoader.getSystemClassLoader());
 
+            if ("select".equals(what)) {
+                String guid = args.length > 2 ? args[2] : "";
+                boolean ok = doSelect(cl, apk, guid);
+                System.exit(ok ? 0 : 1);
+            }
+
             String dtoName;
             String svcName;
             if (what.equals("test")) {
@@ -206,5 +212,124 @@ public final class V2Ctl {
             System.out.println("CTX path failed: " + c);
         }
         return false;
+    }
+
+    /**
+     * 把 SELECTED_SERVER 写成指定 guid —— 直接用它自己的 MMKV 实现，格式/CRC 由库维护。
+     * MMKV 以 MULTI_PROCESS 模式（mode=2）打开，和 v2rayNG 内部一致。
+     */
+    private static boolean doSelect(ClassLoader cl, String apk, String guid) {
+        try {
+            if (guid == null || guid.length() != 32) {
+                System.out.println("need 32-hex guid, got: " + guid);
+                return false;
+            }
+            final String soPath = findMmkvSo(apk);
+            if (soPath == null) {
+                System.out.println("libmmkv.so not found near " + apk);
+                return false;
+            }
+            System.out.println("mmkv so=" + soPath);
+
+            Class<?> mmkvCls = cl.loadClass("com.tencent.mmkv.MMKV");
+            Class<?> loaderItf = cl.loadClass("com.tencent.mmkv.MMKV$LibLoader");
+            Class<?> levelCls = cl.loadClass("com.tencent.mmkv.MMKVLogLevel");
+            Class<?> handlerCls = cl.loadClass("com.tencent.mmkv.MMKVHandler");
+
+            Object libLoader = java.lang.reflect.Proxy.newProxyInstance(
+                    cl, new Class<?>[]{loaderItf}, new java.lang.reflect.InvocationHandler() {
+                        @Override
+                        public Object invoke(Object proxy, Method m, Object[] a) {
+                            if ("loadLibrary".equals(m.getName())) {
+                                try {
+                                    System.load(soPath);
+                                } catch (Throwable t) {
+                                    System.out.println("loadLibrary failed: " + t);
+                                }
+                            }
+                            return null;
+                        }
+                    });
+
+            Object levelInfo = null;
+            for (Object o : levelCls.getEnumConstants()) {
+                if ("LevelInfo".equals(((Enum<?>) o).name())) {
+                    levelInfo = o;
+                }
+            }
+
+            Method init = mmkvCls.getMethod("initialize", android.content.Context.class,
+                    String.class, loaderItf, levelCls, handlerCls);
+            Object root = init.invoke(null, new FakeCtx(),
+                    "/data/data/" + PKG + "/files/mmkv", libLoader, levelInfo, null);
+            System.out.println("mmkv root=" + root);
+
+            Method withID = mmkvCls.getMethod("mmkvWithID", String.class, int.class);
+            Object store = withID.invoke(null, "MAIN", 2);
+            System.out.println("store=" + store);
+
+            Method encode = mmkvCls.getMethod("encode", String.class, String.class);
+            Object r = encode.invoke(store, "SELECTED_SERVER", guid);
+            System.out.println("encode -> " + r);
+
+            Method decode = mmkvCls.getMethod("decodeString", String.class, String.class);
+            Object back = decode.invoke(store, "SELECTED_SERVER", null);
+            System.out.println("readback=" + back);
+
+            boolean ok = guid.equals(back);
+            System.out.println(ok ? "SELECT_OK " + guid : "SELECT_FAIL");
+            return ok;
+        } catch (Throwable t) {
+            Throwable c = (t instanceof java.lang.reflect.InvocationTargetException
+                    && t.getCause() != null) ? t.getCause() : t;
+            System.out.println("select failed: " + c);
+            c.printStackTrace(System.out);
+            return false;
+        }
+    }
+
+    private static String findMmkvSo(String apk) {
+        try {
+            java.io.File base = new java.io.File(apk).getParentFile();
+            if (base == null) {
+                return null;
+            }
+            java.io.File[] dirs = new java.io.File(base, "lib").listFiles();
+            if (dirs == null) {
+                return null;
+            }
+            for (java.io.File d : dirs) {
+                java.io.File f = new java.io.File(d, "libmmkv.so");
+                if (f.exists()) {
+                    return f.getAbsolutePath();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /** 只覆盖 MMKV.initialize 会用到的三个方法，避免依赖真实 Application。 */
+    public static final class FakeCtx extends android.content.ContextWrapper {
+        public FakeCtx() {
+            super(null);
+        }
+
+        @Override
+        public android.content.pm.ApplicationInfo getApplicationInfo() {
+            android.content.pm.ApplicationInfo ai = new android.content.pm.ApplicationInfo();
+            ai.flags = 0;
+            return ai;
+        }
+
+        @Override
+        public java.io.File getCacheDir() {
+            return new java.io.File("/data/data/" + PKG + "/cache");
+        }
+
+        @Override
+        public java.io.File getFilesDir() {
+            return new java.io.File("/data/data/" + PKG + "/files");
+        }
     }
 }
