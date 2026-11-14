@@ -16,6 +16,8 @@ import java.util.ArrayList;
  * 用法:
  *   app_process /system/bin v2ctl.V2Ctl <apk路径> update [--key=8] [--no-force] [subId...]
  *   app_process /system/bin v2ctl.V2Ctl <apk路径> test   [--key=7] <requestId>
+ *   app_process /system/bin v2ctl.V2Ctl <apk路径> select <32位guid>
+ *   app_process /system/bin v2ctl.V2Ctl <apk路径> dedup [--dry-run] [subId]
  */
 public final class V2Ctl {
 
@@ -62,6 +64,19 @@ public final class V2Ctl {
                 String guid = args.length > 2 ? args[2] : "";
                 boolean ok = doSelect(cl, apk, guid);
                 System.exit(ok ? 0 : 1);
+            }
+
+            if ("dedup".equals(what)) {
+                boolean dry = false;
+                String sub = "";
+                for (int i = 2; i < args.length; i++) {
+                    if ("--dry-run".equals(args[i])) {
+                        dry = true;
+                    } else if (!args[i].startsWith("--")) {
+                        sub = args[i];
+                    }
+                }
+                System.exit(doDedup(cl, apk, dry, sub) ? 0 : 1);
             }
 
             String dtoName;
@@ -224,46 +239,10 @@ public final class V2Ctl {
                 System.out.println("need 32-hex guid, got: " + guid);
                 return false;
             }
-            final String soPath = findMmkvSo(apk);
-            if (soPath == null) {
-                System.out.println("libmmkv.so not found near " + apk);
+            if (!initMmkv(cl, apk)) {
                 return false;
             }
-            System.out.println("mmkv so=" + soPath);
-
             Class<?> mmkvCls = cl.loadClass("com.tencent.mmkv.MMKV");
-            Class<?> loaderItf = cl.loadClass("com.tencent.mmkv.MMKV$LibLoader");
-            Class<?> levelCls = cl.loadClass("com.tencent.mmkv.MMKVLogLevel");
-            Class<?> handlerCls = cl.loadClass("com.tencent.mmkv.MMKVHandler");
-
-            Object libLoader = java.lang.reflect.Proxy.newProxyInstance(
-                    cl, new Class<?>[]{loaderItf}, new java.lang.reflect.InvocationHandler() {
-                        @Override
-                        public Object invoke(Object proxy, Method m, Object[] a) {
-                            if ("loadLibrary".equals(m.getName())) {
-                                try {
-                                    System.load(soPath);
-                                } catch (Throwable t) {
-                                    System.out.println("loadLibrary failed: " + t);
-                                }
-                            }
-                            return null;
-                        }
-                    });
-
-            Object levelInfo = null;
-            for (Object o : levelCls.getEnumConstants()) {
-                if ("LevelInfo".equals(((Enum<?>) o).name())) {
-                    levelInfo = o;
-                }
-            }
-
-            Method init = mmkvCls.getMethod("initialize", android.content.Context.class,
-                    String.class, loaderItf, levelCls, handlerCls);
-            Object root = init.invoke(null, new FakeCtx(),
-                    "/data/data/" + PKG + "/files/mmkv", libLoader, levelInfo, null);
-            System.out.println("mmkv root=" + root);
-
             Method withID = mmkvCls.getMethod("mmkvWithID", String.class, int.class);
             Object store = withID.invoke(null, "MAIN", 2);
             System.out.println("store=" + store);
@@ -283,6 +262,169 @@ public final class V2Ctl {
             Throwable c = (t instanceof java.lang.reflect.InvocationTargetException
                     && t.getCause() != null) ? t.getCause() : t;
             System.out.println("select failed: " + c);
+            c.printStackTrace(System.out);
+            return false;
+        }
+    }
+
+    /**
+     * 初始化 APK 自带的 MMKV（FakeCtx 只提供 initialize 需要的三个方法）。
+     * 之后 mmkvWithID(..., 2) 就是多进程模式，和 App 内部一致。
+     */
+    private static boolean initMmkv(ClassLoader cl, String apk) throws Exception {
+        String soPath = findMmkvSo(apk);
+        if (soPath == null) {
+            System.out.println("libmmkv.so not found near " + apk);
+            return false;
+        }
+        System.out.println("mmkv so=" + soPath);
+        final String so = soPath;
+
+        Class<?> mmkvCls = cl.loadClass("com.tencent.mmkv.MMKV");
+        Class<?> loaderItf = cl.loadClass("com.tencent.mmkv.MMKV$LibLoader");
+        Class<?> levelCls = cl.loadClass("com.tencent.mmkv.MMKVLogLevel");
+        Class<?> handlerCls = cl.loadClass("com.tencent.mmkv.MMKVHandler");
+
+        Object libLoader = java.lang.reflect.Proxy.newProxyInstance(
+                cl, new Class<?>[]{loaderItf}, new java.lang.reflect.InvocationHandler() {
+                    @Override
+                    public Object invoke(Object proxy, Method m, Object[] a) {
+                        if ("loadLibrary".equals(m.getName())) {
+                            try {
+                                System.load(so);
+                            } catch (Throwable t) {
+                                System.out.println("loadLibrary failed: " + t);
+                            }
+                        }
+                        return null;
+                    }
+                });
+
+        Object levelInfo = null;
+        for (Object o : levelCls.getEnumConstants()) {
+            if ("LevelInfo".equals(((Enum<?>) o).name())) {
+                levelInfo = o;
+            }
+        }
+
+        Method init = mmkvCls.getMethod("initialize", android.content.Context.class,
+                String.class, loaderItf, levelCls, handlerCls);
+        Object root = init.invoke(null, new FakeCtx(),
+                "/data/data/" + PKG + "/files/mmkv", libLoader, levelInfo, null);
+        System.out.println("mmkv root=" + root);
+        return true;
+    }
+
+    /**
+     * 去重 —— 直接调 v2rayNG 自己的 MmkvManager / ProfileItem.duplicateIdentity()，
+     * MMKV 的格式、CRC、列表索引全部由库和 App 代码维护，不手工拼二进制。
+     *
+     * 判定与 App 的 MainViewModel.removeDuplicateServerAsync() 完全一致：
+     * 忽略 configVersion/subscriptionId/addedTime/remarks/description，
+     * 其余字段（含 server/port/password/network...）全参与比较，
+     * 并跳过 CUSTOM / POLICYGROUP / PROXYCHAIN。
+     */
+    private static boolean doDedup(ClassLoader cl, String apk, boolean dryRun, String onlySub) {
+        try {
+            if (!initMmkv(cl, apk)) {
+                return false;
+            }
+            Class<?> mm = cl.loadClass("com.v2ray.ang.handler.MmkvManager");
+            Object inst = mm.getField("INSTANCE").get(null);
+            Method mDecodeSubs = mm.getMethod("decodeSubsList");
+            Method mDecodeList = mm.getMethod("decodeServerList", String.class);
+            Method mDecodeCfg = mm.getMethod("decodeServerConfig", String.class);
+            Method mRemove = mm.getMethod("removeServers", java.util.List.class, String.class);
+
+            ArrayList<String> subs = new ArrayList<String>();
+            if (onlySub != null && onlySub.length() > 0) {
+                subs.add(onlySub);
+            } else {
+                Object sl = mDecodeSubs.invoke(inst);
+                if (sl instanceof java.util.List) {
+                    for (Object o : (java.util.List<?>) sl) {
+                        subs.add(String.valueOf(o));
+                    }
+                }
+                if (!subs.contains("__default_subscription__")) {
+                    subs.add("__default_subscription__");
+                }
+            }
+            System.out.println("dedup subs=" + subs + " dryRun=" + dryRun);
+
+            int grand = 0;
+            for (String sub : subs) {
+                ArrayList<String> guids = new ArrayList<String>();
+                Object l = mDecodeList.invoke(inst, sub);
+                if (l instanceof java.util.List) {
+                    for (Object o : (java.util.List<?>) l) {
+                        guids.add(String.valueOf(o));
+                    }
+                }
+                if (guids.isEmpty()) {
+                    System.out.println("[skip] " + sub + " 空");
+                    continue;
+                }
+
+                java.util.HashSet<Object> seen = new java.util.HashSet<Object>();
+                ArrayList<String> dups = new ArrayList<String>();
+                java.util.LinkedHashMap<String, Integer> tally =
+                        new java.util.LinkedHashMap<String, Integer>();
+                int complex = 0;
+                int noCfg = 0;
+
+                for (String g : guids) {
+                    Object cfg = mDecodeCfg.invoke(inst, g);
+                    if (cfg == null) {
+                        noCfg++;
+                        continue;
+                    }
+                    Object ct = cfg.getClass().getMethod("getConfigType").invoke(cfg);
+                    String ctName = String.valueOf(ct);
+                    if ("CUSTOM".equals(ctName) || "POLICYGROUP".equals(ctName)
+                            || "PROXYCHAIN".equals(ctName)) {
+                        complex++;
+                        continue;
+                    }
+                    Object ident = cfg.getClass().getMethod("duplicateIdentity").invoke(cfg);
+                    if (seen.add(ident)) {
+                        continue;
+                    }
+                    dups.add(g);
+                    Object s = cfg.getClass().getMethod("getServer").invoke(cfg);
+                    Object p = cfg.getClass().getMethod("getServerPort").invoke(cfg);
+                    String sig = String.valueOf(s) + ":" + String.valueOf(p);
+                    Integer c = tally.get(sig);
+                    tally.put(sig, c == null ? 1 : c + 1);
+                }
+
+                grand += dups.size();
+                System.out.println("[组] " + sub + " 总 " + guids.size() + " / 重复 " + dups.size()
+                        + " / 跳过复杂类型 " + complex + " / 无配置 " + noCfg);
+                int shown = 0;
+                for (java.util.Map.Entry<String, Integer> e : tally.entrySet()) {
+                    if (shown++ >= 10) {
+                        break;
+                    }
+                    System.out.println("    " + e.getKey() + "  多出 " + e.getValue() + " 份");
+                }
+                for (int i = 0; i < dups.size() && i < 5; i++) {
+                    System.out.println("    删除候选 " + dups.get(i));
+                }
+
+                if (!dryRun && !dups.isEmpty()) {
+                    mRemove.invoke(inst, dups, sub);
+                    Object nl = mDecodeList.invoke(inst, sub);
+                    int n = (nl instanceof java.util.List) ? ((java.util.List<?>) nl).size() : -1;
+                    System.out.println("    已删除，写后列表长度 = " + n);
+                }
+            }
+            System.out.println((dryRun ? "DRY_RUN 可删重复=" : "DEDUP_DONE 已删重复=") + grand);
+            return true;
+        } catch (Throwable t) {
+            Throwable c = (t instanceof java.lang.reflect.InvocationTargetException
+                    && t.getCause() != null) ? t.getCause() : t;
+            System.out.println("dedup failed: " + c);
             c.printStackTrace(System.out);
             return false;
         }
