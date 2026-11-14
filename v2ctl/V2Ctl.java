@@ -40,12 +40,15 @@ public final class V2Ctl {
 
             int key = what.equals("test") ? 7 : 8;
             boolean forced = true;
+            boolean onlyTcp = false;
             ArrayList<String> extraIds = new ArrayList<String>();
             for (int i = 2; i < args.length; i++) {
                 if (args[i].startsWith("--key=")) {
                     key = Integer.parseInt(args[i].substring(6));
                 } else if (args[i].equals("--no-force")) {
                     forced = false;
+                } else if (args[i].equals("--tcp")) {
+                    onlyTcp = true;
                 } else {
                     extraIds.add(args[i]);
                 }
@@ -68,7 +71,9 @@ public final class V2Ctl {
             Class<?> dto = cl.loadClass(dtoName);
             System.out.println("dto=" + dto + " loader=" + dto.getClassLoader());
 
-            Object msg = newInstance(dto, key, forced, extraIds);
+            Object msg = what.equals("test")
+                    ? newTestMessage(dto, key, extraIds, onlyTcp)
+                    : newUpdateMessage(dto, key, forced, extraIds);
             System.out.println("msg=" + msg);
 
             Intent it = new Intent();
@@ -90,40 +95,25 @@ public final class V2Ctl {
         }
     }
 
-    /** 优先用 (int,boolean,List)；TestServiceMessage 之类退化到按参数个数匹配。 */
-    private static Object newInstance(Class<?> dto, int key, boolean forced, ArrayList<String> ids)
-            throws Exception {
-        try {
-            Constructor<?> c = dto.getConstructor(int.class, boolean.class, java.util.List.class);
-            return c.newInstance(key, forced, ids);
-        } catch (NoSuchMethodException ignored) {
-        }
-        for (Constructor<?> c : dto.getConstructors()) {
-            Class<?>[] p = c.getParameterTypes();
-            Object[] a = new Object[p.length];
-            int si = 0;
-            boolean fits = true;
-            for (int i = 0; i < p.length; i++) {
-                if (p[i] == int.class) {
-                    a[i] = key;
-                } else if (p[i] == boolean.class) {
-                    a[i] = forced;
-                } else if (p[i] == String.class) {
-                    a[i] = si < ids.size() ? ids.get(si) : "";
-                    si++;
-                } else if (java.util.List.class.isAssignableFrom(p[i])) {
-                    a[i] = ids;
-                } else {
-                    fits = false;
-                    break;
-                }
-            }
-            if (fits) {
-                return c.newInstance(a);
-            }
-        }
-        throw new NoSuchMethodException("no usable constructor on " + dto);
+    /** SubscriptionUpdateMessage(int key, boolean forcedUpdate, List<String> subIds) */
+    private static Object newUpdateMessage(Class<?> dto, int key, boolean forced,
+                                           ArrayList<String> ids) throws Exception {
+        Constructor<?> c = dto.getConstructor(int.class, boolean.class, java.util.List.class);
+        return c.newInstance(key, forced, ids);
     }
+
+    /**
+     * TestServiceMessage(int key, String subscriptionId, List<String> serverGuids, boolean onlyTcp)
+     * 传入的第一个 id 当 subscriptionId，其余当 serverGuids；guids 为空表示该订阅下全部。
+     */
+    private static Object newTestMessage(Class<?> dto, int key, ArrayList<String> ids,
+                                         boolean onlyTcp) throws Exception {
+        String subId = ids.isEmpty() ? "" : ids.remove(0);
+        Constructor<?> c = dto.getConstructor(int.class, String.class, java.util.List.class,
+                boolean.class);
+        return c.newInstance(key, subId, ids, onlyTcp);
+    }
+}
 
     @SuppressWarnings("unchecked")
     private static boolean startViaActivityManager(Intent it) {
