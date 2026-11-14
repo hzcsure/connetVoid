@@ -113,7 +113,6 @@ public final class V2Ctl {
                 boolean.class);
         return c.newInstance(key, subId, ids, onlyTcp);
     }
-}
 
     @SuppressWarnings("unchecked")
     private static boolean startViaActivityManager(Intent it) {
