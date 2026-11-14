@@ -156,7 +156,10 @@ public final class V2Ctl {
                         if (p[i] == int.class) {
                             a[i] = 0;
                         } else if (p[i] == boolean.class) {
-                            a[i] = Boolean.FALSE;
+                            // fgRequired=true -> 等价 startForegroundService，
+                            // 绕过「应用在后台不允许启动服务」的限制；
+                            // 两个服务都会在 onStartCommand 开头立刻 startForeground。
+                            a[i] = Boolean.TRUE;
                         } else if (p[i] == Intent.class) {
                             a[i] = it;
                         } else if (p[i] == String.class) {
