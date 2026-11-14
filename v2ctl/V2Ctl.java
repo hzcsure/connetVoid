@@ -268,6 +268,32 @@ public final class V2Ctl {
     }
 
     /**
+     * 加载 APK 里的 libmmkv.so。
+     * 直接 System.load 时 JNI_OnLoad 的 FindClass 用的是 boot ClassLoader，
+     * 找不到 com.tencent.mmkv.MMKV，JNI_OnLoad 返回 -2。
+     * Runtime.load0(fromClass, path) 会把 fromClass 的 ClassLoader 一起带进
+     * LoadNativeLibrary，JNI_OnLoad 里的 FindClass 才找得到类。
+     */
+    private static void loadNative(Class<?> fromClass, String path) {
+        try {
+            Method m = Class.forName("java.lang.Runtime")
+                    .getDeclaredMethod("load0", Class.class, String.class);
+            m.setAccessible(true);
+            m.invoke(Runtime.getRuntime(), fromClass, path);
+            System.out.println("load0 ok (" + fromClass.getSimpleName() + " loader)");
+            return;
+        } catch (Throwable t) {
+            System.out.println("load0 failed: " + t);
+        }
+        try {
+            System.load(path);
+            System.out.println("System.load ok");
+        } catch (Throwable t) {
+            System.out.println("System.load failed: " + t);
+        }
+    }
+
+    /**
      * 初始化 APK 自带的 MMKV（FakeCtx 只提供 initialize 需要的三个方法）。
      * 之后 mmkvWithID(..., 2) 就是多进程模式，和 App 内部一致。
      */
@@ -279,8 +305,9 @@ public final class V2Ctl {
         }
         System.out.println("mmkv so=" + soPath);
         final String so = soPath;
+        final Class<?> fromCls = cl.loadClass("com.tencent.mmkv.MMKV");
 
-        Class<?> mmkvCls = cl.loadClass("com.tencent.mmkv.MMKV");
+        Class<?> mmkvCls = fromCls;
         Class<?> loaderItf = cl.loadClass("com.tencent.mmkv.MMKV$LibLoader");
         Class<?> levelCls = cl.loadClass("com.tencent.mmkv.MMKVLogLevel");
         Class<?> handlerCls = cl.loadClass("com.tencent.mmkv.MMKVHandler");
@@ -290,11 +317,7 @@ public final class V2Ctl {
                     @Override
                     public Object invoke(Object proxy, Method m, Object[] a) {
                         if ("loadLibrary".equals(m.getName())) {
-                            try {
-                                System.load(so);
-                            } catch (Throwable t) {
-                                System.out.println("loadLibrary failed: " + t);
-                            }
+                            loadNative(fromCls, so);
                         }
                         return null;
                     }
